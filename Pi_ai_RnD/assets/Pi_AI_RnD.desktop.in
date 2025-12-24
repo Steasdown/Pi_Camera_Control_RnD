@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Pi AI Camera RnD (Stage 1)
+Comment=IMX500 person detect with bbox overlay + prints
+Exec=bash -lc "cd __REPO_ROOT__ && ./scripts/run.sh"
+Terminal=true
+Categories=Development;

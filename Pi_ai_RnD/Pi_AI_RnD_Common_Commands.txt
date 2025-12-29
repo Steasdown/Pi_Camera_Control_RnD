@@ -1,0 +1,96 @@
+Common Commands - Pi AI Camera RnD (PC + Pi)
+
+PC (Windows PowerShell)
+----------------------
+# Navigate to repo
+cd "D:\Documents\GitHub\Pi_Camera_Control_RnD\Pi_ai_RnD"
+pwd
+dir
+tree /f
+
+# Git (typical loop)
+git status
+git add .
+git commit -m "message"
+git push
+
+# Open common files quickly
+notepad README.md
+notepad .gitignore
+
+# If you use VS Code
+code .
+
+# SSH sanity check (non-interactive)
+ssh service@192.168.1.111 "echo OK && hostname && uptime"
+
+Pi (Terminal / SSH)
+-------------------
+# SSH into the Pi (interactive)
+ssh service@192.168.1.111
+
+# If Windows warns "REMOTE HOST IDENTIFICATION HAS CHANGED" (after reimage)
+ssh-keygen -R 192.168.1.111
+ssh service@192.168.1.111
+
+# Quick info checks (run on Pi after login)
+whoami
+hostname
+ip -4 addr show | grep -E "inet "
+uptime
+
+# Navigate to project
+cd ~/Pi_Camera_Control_RnD/Pi_ai_RnD
+pwd
+ls
+
+# List project tree (quick validation)
+find . -maxdepth 3 -type f | sort
+
+# Pull latest changes (repeat often)
+cd ~/Pi_Camera_Control_RnD
+git pull
+git rev-parse --short HEAD
+cd ~/Pi_Camera_Control_RnD/Pi_ai_RnD
+
+# Make scripts executable (one-time after clone)
+chmod +x scripts/*.sh
+
+# Bootstrap / setup (one-time per fresh install)
+./scripts/pi_setup.sh
+
+# Activate venv (verify)
+source .venv/bin/activate
+which python
+python -V
+pip -V
+
+# Run app (standard)
+./scripts/run.sh
+./scripts/run.sh --help
+
+# Run app remotely via SSH (no interactive shell)
+ssh service@192.168.1.111 "cd ~/Pi_Camera_Control_RnD/Pi_ai_RnD && ./scripts/run.sh"
+
+# Logs
+ls -lah logs
+tail -f logs/run.log
+tail -n 200 logs/run.log
+
+# Edit files on the Pi
+nano src/pi_ai_rnd/app.py
+nano config/runtime.json
+nano config/models.json
+
+# Find files / grep
+grep -R "TODO" -n src/pi_ai_rnd
+
+Raspberry Pi camera baseline (known-good viewer)
+------------------------------------------------
+# Object detection overlay using rpicam-hello post-processing JSON
+rpicam-hello -t 0s --post-process-file /usr/share/rpi-camera-assets/imx500_mobilenet_ssd.json --viewfinder-width 1920 --viewfinder-height 1080 --framerate 30
+
+# Copy + edit JSON locally (safe way)
+mkdir -p ~/pp
+cp /usr/share/rpi-camera-assets/imx500_mobilenet_ssd.json ~/pp/imx500_mobilenet_ssd.json
+nano ~/pp/imx500_mobilenet_ssd.json

@@ -137,6 +137,34 @@ def _probe_imx500_once(cfg: AppConfig, debug: bool, timeout_s: float, poll_hz: f
         picam2.close()
         if debug:
             print("[probe] camera stopped/closed")
+            
+def _rect_to_xywh(obj, frame_w: int, frame_h: int):
+    """Accept IMX500 convert_inference_coords return types and normalize to (x,y,w,h).
+
+    Supports:
+    - object with attributes: x, y, width, height
+    - tuple/list: (x,y,w,h) OR (x1,y1,x2,y2) (heuristic)
+    """
+    # Attribute-style object
+    if hasattr(obj, "x") and hasattr(obj, "y") and hasattr(obj, "width") and hasattr(obj, "height"):
+        return int(obj.x), int(obj.y), int(obj.width), int(obj.height)
+
+    # Tuple/list style
+    if isinstance(obj, (tuple, list)) and len(obj) == 4:
+        a, b, c, d = (float(obj[0]), float(obj[1]), float(obj[2]), float(obj[3]))
+
+        # Heuristic:
+        # If (a+c, b+d) is within frame bounds, treat as (x,y,w,h).
+        # Otherwise treat as (x1,y1,x2,y2).
+        if (a + c) <= (frame_w * 1.2) and (b + d) <= (frame_h * 1.2):
+            x, y, w, h = a, b, c, d
+        else:
+            x1, y1, x2, y2 = a, b, c, d
+            x, y, w, h = x1, y1, (x2 - x1), (y2 - y1)
+
+        return int(x), int(y), int(w), int(h)
+
+    raise TypeError(f"Unsupported rect type from convert_inference_coords: {type(obj).__name__} {obj!r}")
 
 
 def _run_prototype_b(cfg: AppConfig, debug: bool, run_seconds: float) -> int:
@@ -204,8 +232,10 @@ def _run_prototype_b(cfg: AppConfig, debug: bool, run_seconds: float) -> int:
                     d0 = persons_sorted[0]
                     # C1: convert inference coords -> pixel coords (main stream)
                     obj = imx500.convert_inference_coords(d0.box, metadata, picam2)
-                    x, y = int(obj.x), int(obj.y)
-                    w, h = int(obj.width), int(obj.height)
+                    # Our main stream is 640x480 for Prototype B/C1
+                    frame_w, frame_h = 640, 480
+                    x, y, w, h = _rect_to_xywh(obj, frame_w, frame_h)
+
                     cx, cy = x + w / 2.0, y + h / 2.0
 
                     print(

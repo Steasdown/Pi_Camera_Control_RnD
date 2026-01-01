@@ -202,12 +202,22 @@ def _run_prototype_b(cfg: AppConfig, debug: bool, run_seconds: float) -> int:
                     # Print the highest-score person only (stable/low-noise)
                     persons_sorted = sorted(persons, key=lambda d: d.score, reverse=True)
                     d0 = persons_sorted[0]
-                    print(f"[B][person] score={d0.score:.2f} box4={d0.box}")
+                    # C1: convert inference coords -> pixel coords (main stream)
+                    obj = imx500.convert_inference_coords(d0.box, metadata, picam2)
+                    x, y = int(obj.x), int(obj.y)
+                    w, h = int(obj.width), int(obj.height)
+                    cx, cy = x + w / 2.0, y + h / 2.0
+
+                    print(
+                        f"[C1][person] score={d0.score:.2f} "
+                        f"px=(x={x},y={y},w={w},h={h}) center=({cx:.1f},{cy:.1f}) "
+                        f"raw={d0.box}"
+                    )
                     detections_printed += 1
                     last_print = now
 
                     if debug:
-                        print(f"[B][debug] frames={frames} persons={len(persons)} count={count}")
+                        print(f"[C1][debug] frames={frames} persons={len(persons)} count={count}")
 
             finally:
                 req.release()

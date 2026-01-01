@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""pi_ai_rnd.main — Prototype A
+"""pi_ai_rnd.main — Prototype B
 
-Prototype A goals:
+Prototype B goals:
 - Open IMX500 camera pipeline
-- Capture ONE request
-- Read inference outputs from request metadata
-- Print output tensor shapes ONCE
-- Exit cleanly
+- Continuously read IMX500 outputs from request metadata
+- Parse outputs using pi_ai_rnd.imx500_adapter
+- Filter to PERSON only (class id from config, default 0)
+- Print bbox + confidence at a rate limit (SSH-friendly)
+- Exit cleanly after --run-seconds
 
 Notes:
-- This will NOT run on Windows (no Picamera2/IMX500 there). That’s expected.
-- It is guarded so PC runs will fail gracefully with a clear message.
+- No preview window yet (keeps it simple and stable over SSH).
+- Boxes printed are still "raw inference box 4-vector" until Prototype C,
+  where we will convert to output pixel coords and draw overlays.
 """
 
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .config import AppConfig, load_config
+from .imx500_adapter import normalize_ssd_outputs, build_detections, filter_by_class
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,21 +31,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default="configs/runtime.json",
                    help="Optional runtime config JSON (not required yet).")
     p.add_argument("--debug", action="store_true", help="Verbose debug output.")
-    p.add_argument(
-        "--probe-imx500",
-        action="store_true",
-        help="Prototype A: open camera and print IMX500 output tensor shapes once, then exit.",
-    )
-    p.add_argument("--probe-timeout-s", type=float, default=120.0,
+
+    # Prototype A
+    p.add_argument("--probe-imx500", action="store_true",
+                   help="Prototype A: print IMX500 output tensor shapes once, then exit.")
+    p.add_argument("--probe-timeout-s", type=float, default=180.0,
                    help="Max seconds to wait for IMX500 outputs (Prototype A).")
     p.add_argument("--probe-poll-hz", type=float, default=10.0,
                    help="How often to sample requests while waiting (Prototype A).")
 
+    # Prototype B
+    p.add_argument("--run-b", action="store_true",
+                   help="Prototype B: print person detections for --run-seconds then exit.")
+    p.add_argument("--run-seconds", type=float, default=10.0,
+                   help="How long to run Prototype B loop.")
     return p.parse_args()
 
 
 def _shape(x: Any) -> str:
-    # Robust shape printer for numpy arrays / lists / scalars
     s = getattr(x, "shape", None)
     if s is not None:
         return str(s)
@@ -50,10 +57,17 @@ def _shape(x: Any) -> str:
     return f"{type(x).__name__}"
 
 
-def _probe_imx500_once(cfg: AppConfig, debug: bool, timeout_s: float, poll_hz: float) -> int:
-    """Open IMX500 camera, wait for inference outputs, print output shapes once, exit."""
+def _get_outputs(imx500, metadata):
+    # API differs across versions
     try:
-        # Pi-only imports
+        return imx500.get_outputs(metadata, add_batch=True)
+    except TypeError:
+        return imx500.get_outputs(metadata)
+
+
+def _probe_imx500_once(cfg: AppConfig, debug: bool, timeout_s: float, poll_hz: float) -> int:
+    """Prototype A: wait for outputs, print shapes once, exit."""
+    try:
         from picamera2 import Picamera2
         from picamera2.devices.imx500 import IMX500
     except Exception as e:
@@ -61,16 +75,11 @@ def _probe_imx500_once(cfg: AppConfig, debug: bool, timeout_s: float, poll_hz: f
         print(f"[probe] {type(e).__name__}: {e}")
         return 2
 
-    import time
+    print(f"[probe] model_path: {cfg.model_path}")
 
-    model_path = cfg.model_path
-    print(f"[probe] model_path: {model_path}")
-
-    # Must create IMX500 before Picamera2
-    imx500 = IMX500(model_path)
+    imx500 = IMX500(cfg.model_path)
     picam2 = Picamera2(imx500.camera_num)
 
-    # No preview window needed for Prototype A; we just need requests + metadata.
     config = picam2.create_preview_configuration(
         main={"size": (640, 480), "format": "RGB888"},
         buffer_count=4,
@@ -91,19 +100,11 @@ def _probe_imx500_once(cfg: AppConfig, debug: bool, timeout_s: float, poll_hz: f
 
         while time.monotonic() < deadline:
             tries += 1
-
             req = picam2.capture_request()
             try:
                 metadata = req.get_metadata()
-
-                # API differs across versions; try add_batch=True then fallback.
-                try:
-                    outputs = imx500.get_outputs(metadata, add_batch=True)
-                except TypeError:
-                    outputs = imx500.get_outputs(metadata)
-
+                outputs = _get_outputs(imx500, metadata)
                 if outputs is not None:
-                    # Print shapes in a deterministic way, then exit.
                     if isinstance(outputs, dict):
                         print("[probe] outputs: dict")
                         for k in sorted(outputs.keys()):
@@ -117,11 +118,9 @@ def _probe_imx500_once(cfg: AppConfig, debug: bool, timeout_s: float, poll_hz: f
 
                     print(f"[probe] success after {tries} request(s)")
                     return 0
-
             finally:
                 req.release()
 
-            # Status heartbeat every ~2s so you can see progress over SSH
             now = time.monotonic()
             if debug and (now - last_status) > 2.0:
                 remaining = max(0.0, deadline - now)
@@ -140,6 +139,89 @@ def _probe_imx500_once(cfg: AppConfig, debug: bool, timeout_s: float, poll_hz: f
             print("[probe] camera stopped/closed")
 
 
+def _run_prototype_b(cfg: AppConfig, debug: bool, run_seconds: float) -> int:
+    """Prototype B: person-only prints (no overlay), then exit."""
+    try:
+        from picamera2 import Picamera2
+        from picamera2.devices.imx500 import IMX500
+    except Exception as e:
+        print("[B] Picamera2/IMX500 not available on this machine.")
+        print(f"[B] {type(e).__name__}: {e}")
+        return 2
+
+    print("[B] starting")
+    print(f"[B] model_path: {cfg.model_path}")
+    print(f"[B] threshold: {cfg.score_threshold}")
+    print(f"[B] target_class_id: {cfg.target_class_id} ({cfg.target_class_name})")
+    print(f"[B] run_seconds: {run_seconds}")
+
+    imx500 = IMX500(cfg.model_path)
+    picam2 = Picamera2(imx500.camera_num)
+
+    # No preview window; keep main stream small
+    config = picam2.create_preview_configuration(
+        main={"size": (640, 480), "format": "RGB888"},
+        buffer_count=6,
+    )
+    picam2.configure(config)
+
+    # Rate limit prints for SSH
+    last_print = 0.0
+    min_dt = 1.0 / max(0.1, float(cfg.print_hz))
+
+    deadline = time.monotonic() + float(run_seconds)
+    frames = 0
+    detections_printed = 0
+
+    try:
+        picam2.start()
+
+        while time.monotonic() < deadline:
+            req = picam2.capture_request()
+            try:
+                frames += 1
+                metadata = req.get_metadata()
+                outputs = _get_outputs(imx500, metadata)
+                norm = normalize_ssd_outputs(outputs)
+                if norm is None:
+                    continue
+
+                boxes, scores, classes, count = norm
+                dets = build_detections(
+                    boxes=boxes,
+                    scores=scores,
+                    classes=classes,
+                    count=count,
+                    threshold=cfg.score_threshold,
+                )
+                persons = filter_by_class(dets, cfg.target_class_id)
+
+                # Print at most cfg.print_hz
+                now = time.monotonic()
+                if persons and (now - last_print) >= min_dt:
+                    # Print the highest-score person only (stable/low-noise)
+                    persons_sorted = sorted(persons, key=lambda d: d.score, reverse=True)
+                    d0 = persons_sorted[0]
+                    print(f"[B][person] score={d0.score:.2f} box4={d0.box}")
+                    detections_printed += 1
+                    last_print = now
+
+                    if debug:
+                        print(f"[B][debug] frames={frames} persons={len(persons)} count={count}")
+
+            finally:
+                req.release()
+
+        print(f"[B] done: frames={frames} printed={detections_printed}")
+        return 0
+
+    finally:
+        picam2.stop()
+        picam2.close()
+        if debug:
+            print("[B] camera stopped/closed")
+
+
 def main() -> int:
     args = parse_args()
     cfg: AppConfig = load_config(Path(args.config))
@@ -147,14 +229,15 @@ def main() -> int:
     if args.probe_imx500:
         return _probe_imx500_once(cfg, args.debug, args.probe_timeout_s, args.probe_poll_hz)
 
+    if args.run_b:
+        return _run_prototype_b(cfg, args.debug, args.run_seconds)
 
-    # Default behavior (still scaffold)
     print("Pi AI Camera RnD — Stage 1 scaffold running.")
     print(f"Config path: {args.config}")
     print(f"Model path (planned): {cfg.model_path}")
     print(f"Target class (planned): {cfg.target_class_name} (id={cfg.target_class_id})")
     print(f"Threshold (planned): {cfg.score_threshold}")
-    print("Use --probe-imx500 for Prototype A tensor-shape probe.")
+    print("Use --probe-imx500 for Prototype A, or --run-b for Prototype B.")
     return 0
 
 

@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
                    help="Prototype B: print person detections for --run-seconds then exit.")
     p.add_argument("--run-seconds", type=float, default=10.0,
                    help="How long to run Prototype B loop.")
+    
+    # Prototype C
+    p.add_argument("--run-c2", action="store_true",
+               help="Prototype C2: show a live window + red person bbox overlay.")
+    p.add_argument("--view-size", default="1280x720",
+               help="Window stream size WxH, e.g. 1280x720")
     return p.parse_args()
 
 
@@ -260,6 +266,123 @@ def _run_prototype_b(cfg: AppConfig, debug: bool, run_seconds: float) -> int:
         picam2.close()
         if debug:
             print("[B] camera stopped/closed")
+            
+def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size: str) -> int:
+    """Prototype C2: OpenCV window with red person bbox overlay."""
+    try:
+        import cv2
+        from picamera2 import Picamera2
+        from picamera2.devices.imx500 import IMX500
+    except Exception as e:
+        print("[C2] Required modules not available.")
+        print(f"[C2] {type(e).__name__}: {e}")
+        return 2
+
+    # Parse view size "WxH"
+    try:
+        w_str, h_str = view_size.lower().split("x")
+        frame_w, frame_h = int(w_str), int(h_str)
+    except Exception:
+        print(f"[C2] Bad --view-size '{view_size}'. Use e.g. 1280x720")
+        return 2
+
+    print("[C2] starting (OpenCV window)")
+    print(f"[C2] model_path: {cfg.model_path}")
+    print(f"[C2] threshold: {cfg.score_threshold}")
+    print(f"[C2] target_class_id: {cfg.target_class_id} ({cfg.target_class_name})")
+    print(f"[C2] view: {frame_w}x{frame_h}")
+    print("[C2] press 'q' in the window to quit")
+
+    imx500 = IMX500(cfg.model_path)
+    picam2 = Picamera2(imx500.camera_num)
+
+    config = picam2.create_preview_configuration(
+        main={"size": (frame_w, frame_h), "format": "RGB888"},
+        buffer_count=6,
+    )
+    picam2.configure(config)
+
+    window_name = "Pi AI RnD (C2)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    last_print = 0.0
+    min_dt = 1.0 / max(0.1, float(cfg.print_hz))
+
+    deadline = time.monotonic() + float(run_seconds) if run_seconds > 0 else float("inf")
+    frames = 0
+    printed = 0
+
+    try:
+        picam2.start()
+
+        while time.monotonic() < deadline:
+            # Get a frame to display (RGB)
+            frame_rgb = picam2.capture_array("main")
+            frames += 1
+
+            # Also grab metadata for detections
+            req = picam2.capture_request()
+            try:
+                metadata = req.get_metadata()
+                outputs = _get_outputs(imx500, metadata)
+                norm = normalize_ssd_outputs(outputs)
+            finally:
+                req.release()
+
+            # Convert to BGR for OpenCV display
+            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            if norm is not None:
+                boxes, scores, classes, count = norm
+                dets = build_detections(
+                    boxes=boxes, scores=scores, classes=classes,
+                    count=count, threshold=cfg.score_threshold
+                )
+                persons = filter_by_class(dets, cfg.target_class_id)
+
+                if persons:
+                    d0 = max(persons, key=lambda d: d.score)
+
+                    # Convert inference box -> pixel rect
+                    rect = imx500.convert_inference_coords(d0.box, metadata, picam2)
+                    x, y, w, h = _rect_to_xywh(rect, frame_w, frame_h)
+
+                    # Clamp for safety
+                    x = max(0, min(x, frame_w - 1))
+                    y = max(0, min(y, frame_h - 1))
+                    w = max(0, min(w, frame_w - x))
+                    h = max(0, min(h, frame_h - y))
+
+                    # Draw red bbox + label
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                    cv2.putText(
+                        frame, f"person {d0.score:.2f}",
+                        (x + 5, max(20, y - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
+                    )
+
+                    # Optional rate-limited console print (still useful over SSH logs)
+                    now = time.monotonic()
+                    if (now - last_print) >= min_dt:
+                        cx, cy = x + w / 2.0, y + h / 2.0
+                        print(f"[C2][person] score={d0.score:.2f} px=(x={x},y={y},w={w},h={h}) center=({cx:.1f},{cy:.1f})")
+                        printed += 1
+                        last_print = now
+
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+
+        print(f"[C2] done: frames={frames} printed={printed}")
+        return 0
+
+    finally:
+        picam2.stop()
+        picam2.close()
+        cv2.destroyAllWindows()
+        if debug:
+            print("[C2] camera stopped/closed")
 
 
 def main() -> int:
@@ -271,6 +394,10 @@ def main() -> int:
 
     if args.run_b:
         return _run_prototype_b(cfg, args.debug, args.run_seconds)
+    
+    if args.run_c2:
+        return _run_prototype_c2(cfg, args.debug, args.run_seconds, args.view_size)
+
 
     print("Pi AI Camera RnD — Stage 1 scaffold running.")
     print(f"Config path: {args.config}")

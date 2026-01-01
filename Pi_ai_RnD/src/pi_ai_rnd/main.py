@@ -49,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     # Prototype C
     p.add_argument("--run-c2", action="store_true",
                help="Prototype C2: show a live window + red person bbox overlay.")
-    p.add_argument("--view-size", default="1280x720",
-               help="Window stream size WxH, e.g. 1280x720")
+    p.add_argument("--view-size", default="1920x1080",
+               help="Window stream size WxH, e.g. 1920x1080.")
     return p.parse_args()
 
 

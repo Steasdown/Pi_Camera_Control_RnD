@@ -1,27 +1,29 @@
-"""pi_ai_rnd.imx500_adapter — IMX500 parsing & coordinate conversion
+"""
+pi_ai_rnd.imx500_adapter
 
-Prototype A confirmed IMX500 SSD output tensor shapes:
+Purpose
+-------
+Pure parsing utilities for IMX500 SSD-style outputs.
+
+This module:
+- DOES NOT open the camera.
+- DOES NOT depend on Picamera2 objects.
+- DOES NOT do coordinate conversion (that requires IMX500 + metadata + Picamera2).
+
+It only takes raw IMX500 network outputs and normalizes them into predictable
+numpy arrays and lightweight Python records.
+
+Observed on your Pi (Prototype A):
 - boxes:   (1, 100, 4)
 - scores:  (1, 100)
 - classes: (1, 100)
-- count:   (1, 1)   (may represent number of valid detections)
+- count:   (1, 1)  (may be valid-detection count, or may be unused/padded)
 
-This module converts the raw IMX500 outputs into a predictable Python structure.
-
-Important:
-- This module does NOT open the camera.
-- It does NOT depend on Picamera2 objects.
-- It is purely parsing utilities + small data structures.
-
-Next step (Prototype B):
-- main.py will open camera, fetch outputs, call normalize_ssd_outputs(), then
-  filter to person and print bbox coords + confidence.
-
-Note:
-- Coordinate conversion (inference -> ISP output coords) is done by:
-    imx500.convert_inference_coords(box, metadata, picam2)
-  That call requires IMX500 instance + metadata + Picamera2. We keep that in main.py
-  (or a future runtime module), not here.
+Notes
+-----
+- The 4-vector box format is model-dependent. For many SSD MobileNet pipelines,
+  it is often [ymin, xmin, ymax, xmax] in normalized inference coordinates.
+  Until we explicitly confirm, this module treats the box as an opaque 4-float tuple.
 """
 
 from __future__ import annotations
@@ -34,18 +36,12 @@ import numpy as np
 
 @dataclass(frozen=True)
 class DetectedObject:
-    """A normalized detection record.
-
-    Coordinates are *not* filled in by this module (yet), because coordinate conversion
-    needs IMX500 + metadata + Picamera2. For Prototype B we only print raw boxes in
-    inference coordinate space first, then we will switch to converted coords.
+    """Normalized detection record (model/inference coordinate space).
 
     Fields:
-        class_id: COCO class id (often person==0 for SSD MobileNet)
-        score: confidence score 0..1
-        box: tuple of 4 floats as provided by model. Meaning depends on model (often
-             [ymin, xmin, ymax, xmax] or similar). We will treat it as an opaque 4-vector
-             until we confirm mapping during Prototype B/C.
+        class_id: integer class id (often person==0 for COCO SSD MobileNet)
+        score: confidence score (0..1)
+        box: 4-vector from the model output (opaque until format is confirmed)
     """
     class_id: int
     score: float
@@ -53,27 +49,24 @@ class DetectedObject:
 
 
 def normalize_ssd_outputs(outputs: Any) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
-    """Normalize SSD-style IMX500 outputs to (boxes, scores, classes, count).
+    """Normalize raw IMX500 SSD-like outputs to (boxes, scores, classes, count).
 
-    Expected (from Prototype A):
-        outputs is list/tuple length >= 4:
-            outputs[0] -> boxes   (1, N, 4)
-            outputs[1] -> scores  (1, N)
-            outputs[2] -> classes (1, N)
-            outputs[3] -> count   (1, 1)  (or sometimes scalar/shape variants)
+    Accepts either:
+      A) list/tuple: [boxes, scores, classes, count?]
+      B) dict-like (best-effort): keys like boxes/scores/classes/count
 
     Returns:
-        boxes:   np.ndarray (N,4) float32/float64
-        scores:  np.ndarray (N,)  float32/float64
-        classes: np.ndarray (N,)  int
-        count:   int number of valid detections (0..N)
+        boxes   : (N,4) float ndarray
+        scores  : (N,)  float ndarray
+        classes : (N,)  int ndarray
+        count   : int   number of valid detections in [0..N]
 
-    If outputs doesn't look like SSD outputs, return None.
+    If the structure does not look like SSD outputs, returns None.
     """
     if outputs is None:
         return None
 
-    # Some versions might return dict-like outputs; support basic keys if present.
+    # --- Extract raw tensors ---
     if isinstance(outputs, dict):
         boxes = outputs.get("boxes") or outputs.get("bboxes") or outputs.get("box")
         scores = outputs.get("scores") or outputs.get("score")
@@ -89,21 +82,22 @@ def normalize_ssd_outputs(outputs: Any) -> Optional[Tuple[np.ndarray, np.ndarray
         classes = outputs[2]
         count = outputs[3] if len(outputs) >= 4 else None
 
+    # --- Convert to numpy ---
     boxes = np.asarray(boxes)
     scores = np.asarray(scores)
     classes = np.asarray(classes)
 
-    # Peel leading singleton dims (batch)
-    # boxes: (1,N,4) -> (N,4)
+    # --- Remove leading batch dims, if present ---
+    # boxes:   (1,N,4) -> (N,4)
+    # scores:  (1,N)   -> (N,)
+    # classes: (1,N)   -> (N,)
     while boxes.ndim > 2 and boxes.shape[0] == 1:
         boxes = boxes[0]
-    # scores/classes: (1,N) -> (N,)
     while scores.ndim > 1 and scores.shape[0] == 1:
         scores = scores[0]
     while classes.ndim > 1 and classes.shape[0] == 1:
         classes = classes[0]
 
-    # Sanity
     boxes = np.atleast_2d(boxes)
     scores = np.atleast_1d(scores)
     classes = np.atleast_1d(classes)
@@ -111,13 +105,14 @@ def normalize_ssd_outputs(outputs: Any) -> Optional[Tuple[np.ndarray, np.ndarray
     if boxes.shape[-1] != 4:
         return None
 
+    # --- Align lengths safely ---
     n = min(len(boxes), len(scores), len(classes))
     boxes = boxes[:n]
     scores = scores[:n]
     classes = classes[:n].astype(int, copy=False)
 
-    # Count parsing:
-    # Typically (1,1) ndarray; sometimes scalar. If missing, assume N.
+    # --- Parse count (valid detections) ---
+    # Some pipelines provide count as (1,1) tensor; if absent, assume all N.
     det_count = n
     if count is not None:
         c = np.asarray(count)
@@ -137,21 +132,26 @@ def build_detections(
     count: int,
     threshold: float,
 ) -> List[DetectedObject]:
-    """Build a list of DetectedObject filtered by score threshold.
+    """Build DetectedObject list from normalized arrays.
 
-    Uses only first 'count' entries (model may pad to N=100).
+    - Only examines the first `count` entries (many models pad to N=100).
+    - Applies score threshold.
     """
     dets: List[DetectedObject] = []
-    for i in range(int(count)):
+    max_i = int(count)
+
+    for i in range(max_i):
         s = float(scores[i])
         if s < float(threshold):
             continue
         cid = int(classes[i])
-        b = tuple(float(x) for x in boxes[i].tolist())  # 4-vector
-        dets.append(DetectedObject(class_id=cid, score=s, box=b))  # raw inference coords for now
+        b = tuple(float(x) for x in boxes[i].tolist())  # opaque 4-vector
+        dets.append(DetectedObject(class_id=cid, score=s, box=b))
+
     return dets
 
 
 def filter_by_class(dets: List[DetectedObject], class_id: int) -> List[DetectedObject]:
-    """Return detections matching class_id."""
-    return [d for d in dets if d.class_id == int(class_id)]
+    """Filter detections by class id."""
+    target = int(class_id)
+    return [d for d in dets if d.class_id == target]

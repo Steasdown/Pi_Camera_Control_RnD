@@ -1,56 +1,67 @@
-"""pi_ai_rnd.config — central configuration (scaffold)
-
-Rules:
-- Avoid absolute paths in Python code where possible.
-- Scripts are responsible for repo-root resolution and venv activation.
-- Keep thresholds, class filters, and logging flags here.
-
-This loader is deliberately forgiving for scaffolding:
-- missing config file -> defaults
-- invalid JSON -> defaults
-"""
-
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
-import json
+from typing import Any, Dict
 
 
 @dataclass(frozen=True)
 class AppConfig:
-    # Default IMX500 model path on Pi (installed by imx500-all)
+    """
+    Runtime configuration for V1.
+
+    Notes:
+    - `score_threshold` is applied once when building detections.
+    - `view_size` is the *display stream* size (also used for pixel bbox conversion).
+    - `ema_alpha` and `hold_s` control overlay stability:
+        - ema_alpha: 0..1  (higher = more responsive, less smooth)
+        - hold_s: seconds to keep last bbox drawn after last detection
+    """
     model_path: str = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
-
-    # COCO: person is often class id 0 in SSD MobileNet pipelines (verify later).
-    target_class_name: str = "person"
-    target_class_id: int = 0
-
-    # Detection threshold
     score_threshold: float = 0.55
+    print_hz: float = 5.0
 
-    # Output controls (planned)
-    print_hz: float = 10.0
-    enable_csv: bool = False
-    csv_path: str = "logs/detections.csv"
+    target_class_id: int = 0
+    target_class_name: str = "person"
+
+    view_size: str = "1270x720"
+
+    ema_alpha: float = 0.35
+    hold_s: float = 0.25
 
 
-def load_config(config_path: Path) -> AppConfig:
-    cfg = AppConfig()
-    if not config_path.exists():
-        return cfg
-
+def _coerce_float(v: Any, default: float) -> float:
     try:
-        data = json.loads(config_path.read_text(encoding="utf-8"))
+        return float(v)
     except Exception:
-        return cfg
+        return default
+
+
+def _coerce_int(v: Any, default: int) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def load_config(path: Path) -> AppConfig:
+    """
+    Load config JSON. Unknown keys are ignored.
+    Missing file -> defaults.
+    """
+    if not path.exists():
+        return AppConfig()
+
+    data: Dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
 
     return AppConfig(
-        model_path=data.get("model_path", cfg.model_path),
-        target_class_name=data.get("target_class_name", cfg.target_class_name),
-        target_class_id=int(data.get("target_class_id", cfg.target_class_id)),
-        score_threshold=float(data.get("score_threshold", cfg.score_threshold)),
-        print_hz=float(data.get("print_hz", cfg.print_hz)),
-        enable_csv=bool(data.get("enable_csv", cfg.enable_csv)),
-        csv_path=data.get("csv_path", cfg.csv_path),
+        model_path=str(data.get("model_path", AppConfig.model_path)),
+        score_threshold=_coerce_float(data.get("score_threshold", AppConfig.score_threshold), AppConfig.score_threshold),
+        print_hz=_coerce_float(data.get("print_hz", AppConfig.print_hz), AppConfig.print_hz),
+        target_class_id=_coerce_int(data.get("target_class_id", AppConfig.target_class_id), AppConfig.target_class_id),
+        target_class_name=str(data.get("target_class_name", AppConfig.target_class_name)),
+        view_size=str(data.get("view_size", AppConfig.view_size)),
+        ema_alpha=_coerce_float(data.get("ema_alpha", AppConfig.ema_alpha), AppConfig.ema_alpha),
+        hold_s=_coerce_float(data.get("hold_s", AppConfig.hold_s), AppConfig.hold_s),
     )

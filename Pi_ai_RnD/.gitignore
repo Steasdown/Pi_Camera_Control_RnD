@@ -1,18 +1,22 @@
-# Runtime outputs (Pi + local)
+# runtime artifacts
 logs/
 *.log
 
-# Python cache
+# python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Virtual environments (Pi)
 .venv/
 venv/
+.env
 
-# OS/editor noise
+# OS/editor
 .DS_Store
 Thumbs.db
 .vscode/
+.idea/
+
+# release artifacts (optional)
+releases/**/*.zip
+releases/**/*.tar.gz

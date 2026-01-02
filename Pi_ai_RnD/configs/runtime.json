@@ -1,6 +1,12 @@
 {
+  "model_path": "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk",
   "score_threshold": 0.55,
-  "print_hz": 1.0,
+  "print_hz": 5.0,
   "target_class_id": 0,
-  "target_class_name": "person"
+  "target_class_name": "person",
+
+  "view_size": "1270x720",
+
+  "ema_alpha": 0.35,
+  "hold_s": 0.25
 }

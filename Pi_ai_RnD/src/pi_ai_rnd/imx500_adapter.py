@@ -1,157 +1,137 @@
-"""pi_ai_rnd.imx500_adapter — IMX500 parsing & coordinate conversion
-
-Prototype A confirmed IMX500 SSD output tensor shapes:
-- boxes:   (1, 100, 4)
-- scores:  (1, 100)
-- classes: (1, 100)
-- count:   (1, 1)   (may represent number of valid detections)
-
-This module converts the raw IMX500 outputs into a predictable Python structure.
-
-Important:
-- This module does NOT open the camera.
-- It does NOT depend on Picamera2 objects.
-- It is purely parsing utilities + small data structures.
-
-Next step (Prototype B):
-- main.py will open camera, fetch outputs, call normalize_ssd_outputs(), then
-  filter to person and print bbox coords + confidence.
-
-Note:
-- Coordinate conversion (inference -> ISP output coords) is done by:
-    imx500.convert_inference_coords(box, metadata, picam2)
-  That call requires IMX500 instance + metadata + Picamera2. We keep that in main.py
-  (or a future runtime module), not here.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
-
-import numpy as np
+from typing import Any, Iterable, Optional, Tuple
 
 
 @dataclass(frozen=True)
-class DetectedObject:
-    """A normalized detection record.
-
-    Coordinates are *not* filled in by this module (yet), because coordinate conversion
-    needs IMX500 + metadata + Picamera2. For Prototype B we only print raw boxes in
-    inference coordinate space first, then we will switch to converted coords.
-
-    Fields:
-        class_id: COCO class id (often person==0 for SSD MobileNet)
-        score: confidence score 0..1
-        box: tuple of 4 floats as provided by model. Meaning depends on model (often
-             [ymin, xmin, ymax, xmax] or similar). We will treat it as an opaque 4-vector
-             until we confirm mapping during Prototype B/C.
+class Detection:
     """
-    class_id: int
+    Single SSD detection.
+
+    box: raw inference 4-vector in model output space (as provided by IMX500 metadata)
+    score: confidence
+    class_id: integer class index
+    """
+    box: tuple[float, float, float, float]
     score: float
-    box: Tuple[float, float, float, float]
+    class_id: int
 
 
-def normalize_ssd_outputs(outputs: Any) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
-    """Normalize SSD-style IMX500 outputs to (boxes, scores, classes, count).
+def normalize_ssd_outputs(outputs: Any) -> Optional[Tuple[Any, Any, Any, int]]:
+    """
+    Normalize IMX500 SSD outputs into (boxes, scores, classes, count).
 
-    Expected (from Prototype A):
-        outputs is list/tuple length >= 4:
-            outputs[0] -> boxes   (1, N, 4)
-            outputs[1] -> scores  (1, N)
-            outputs[2] -> classes (1, N)
-            outputs[3] -> count   (1, 1)  (or sometimes scalar/shape variants)
+    Expected common shape (from your probe):
+      boxes   (1,100,4)
+      scores  (1,100)
+      classes (1,100)
+      count   (1,1)
 
-    Returns:
-        boxes:   np.ndarray (N,4) float32/float64
-        scores:  np.ndarray (N,)  float32/float64
-        classes: np.ndarray (N,)  int
-        count:   int number of valid detections (0..N)
-
-    If outputs doesn't look like SSD outputs, return None.
+    This function accepts outputs in:
+    - list/tuple length 4: [boxes, scores, classes, count]
+    - dict: tries common key names
     """
     if outputs is None:
         return None
 
-    # Some versions might return dict-like outputs; support basic keys if present.
+    # dict-style
     if isinstance(outputs, dict):
-        boxes = outputs.get("boxes") or outputs.get("bboxes") or outputs.get("box")
+        # Try common keys (varies by versions/models)
+        boxes = outputs.get("boxes") or outputs.get("bbox") or outputs.get("box")
         scores = outputs.get("scores") or outputs.get("score")
-        classes = outputs.get("classes") or outputs.get("class_ids") or outputs.get("class")
-        count = outputs.get("count") or outputs.get("num") or outputs.get("num_dets")
-        if boxes is None or scores is None or classes is None:
+        classes = outputs.get("classes") or outputs.get("class") or outputs.get("labels")
+        count = outputs.get("count") or outputs.get("num") or outputs.get("n")
+        if boxes is None or scores is None or classes is None or count is None:
             return None
-    else:
-        if not isinstance(outputs, (list, tuple)) or len(outputs) < 3:
-            return None
-        boxes = outputs[0]
-        scores = outputs[1]
-        classes = outputs[2]
-        count = outputs[3] if len(outputs) >= 4 else None
+        return boxes, scores, classes, int(_to_scalar(count))
 
-    boxes = np.asarray(boxes)
-    scores = np.asarray(scores)
-    classes = np.asarray(classes)
+    # list/tuple-style
+    if isinstance(outputs, (list, tuple)) and len(outputs) >= 4:
+        boxes, scores, classes, count = outputs[0], outputs[1], outputs[2], outputs[3]
+        return boxes, scores, classes, int(_to_scalar(count))
 
-    # Peel leading singleton dims (batch)
-    # boxes: (1,N,4) -> (N,4)
-    while boxes.ndim > 2 and boxes.shape[0] == 1:
-        boxes = boxes[0]
-    # scores/classes: (1,N) -> (N,)
-    while scores.ndim > 1 and scores.shape[0] == 1:
-        scores = scores[0]
-    while classes.ndim > 1 and classes.shape[0] == 1:
-        classes = classes[0]
+    return None
 
-    # Sanity
-    boxes = np.atleast_2d(boxes)
-    scores = np.atleast_1d(scores)
-    classes = np.atleast_1d(classes)
 
-    if boxes.shape[-1] != 4:
-        return None
+def _to_scalar(x: Any) -> float:
+    """
+    Convert numpy-ish scalars/arrays into a python scalar.
+    """
+    try:
+        # numpy scalar
+        return float(x)
+    except Exception:
+        pass
 
-    n = min(len(boxes), len(scores), len(classes))
-    boxes = boxes[:n]
-    scores = scores[:n]
-    classes = classes[:n].astype(int, copy=False)
+    # numpy array with one element, or nested
+    try:
+        # e.g. shape (1,1)
+        return float(x.reshape(-1)[0])
+    except Exception:
+        pass
 
-    # Count parsing:
-    # Typically (1,1) ndarray; sometimes scalar. If missing, assume N.
-    det_count = n
-    if count is not None:
-        c = np.asarray(count)
-        try:
-            det_count = int(c.reshape(-1)[0])
-            det_count = max(0, min(det_count, n))
-        except Exception:
-            det_count = n
+    # list/tuple nested
+    if isinstance(x, (list, tuple)) and x:
+        return _to_scalar(x[0])
 
-    return boxes, scores, classes, det_count
+    raise TypeError(f"Cannot coerce to scalar: {type(x).__name__}")
 
 
 def build_detections(
-    boxes: np.ndarray,
-    scores: np.ndarray,
-    classes: np.ndarray,
+    boxes: Any,
+    scores: Any,
+    classes: Any,
     count: int,
     threshold: float,
-) -> List[DetectedObject]:
-    """Build a list of DetectedObject filtered by score threshold.
-
-    Uses only first 'count' entries (model may pad to N=100).
+) -> list[Detection]:
     """
-    dets: List[DetectedObject] = []
-    for i in range(int(count)):
-        s = float(scores[i])
+    Build detections list applying the SINGLE threshold (caller passes cfg.score_threshold).
+
+    boxes: (1,N,4) or (N,4)
+    scores/classes: (1,N) or (N,)
+    count: number of valid detections (may be <= N)
+    """
+    # Squeeze batch dimension if present
+    try:
+        if getattr(boxes, "ndim", 0) == 3:
+            boxes_n = boxes[0]
+        else:
+            boxes_n = boxes
+        if getattr(scores, "ndim", 0) == 2:
+            scores_n = scores[0]
+        else:
+            scores_n = scores
+        if getattr(classes, "ndim", 0) == 2:
+            classes_n = classes[0]
+        else:
+            classes_n = classes
+    except Exception:
+        boxes_n, scores_n, classes_n = boxes, scores, classes
+
+    dets: list[Detection] = []
+    n = int(count) if int(count) > 0 else 0
+
+    for i in range(n):
+        try:
+            s = float(scores_n[i])
+        except Exception:
+            continue
         if s < float(threshold):
             continue
-        cid = int(classes[i])
-        b = tuple(float(x) for x in boxes[i].tolist())  # 4-vector
-        dets.append(DetectedObject(class_id=cid, score=s, box=b))  # raw inference coords for now
+
+        try:
+            c = int(classes_n[i])
+        except Exception:
+            c = int(float(classes_n[i]))
+
+        b = boxes_n[i]
+        # Ensure plain python floats
+        box4 = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+        dets.append(Detection(box=box4, score=s, class_id=c))
+
     return dets
 
 
-def filter_by_class(dets: List[DetectedObject], class_id: int) -> List[DetectedObject]:
-    """Return detections matching class_id."""
+def filter_by_class(dets: Iterable[Detection], class_id: int) -> list[Detection]:
     return [d for d in dets if d.class_id == int(class_id)]

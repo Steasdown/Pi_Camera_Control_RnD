@@ -1,96 +1,38 @@
-Common Commands - Pi AI Camera RnD (PC + Pi)
+# Pi AI Camera RnD — Common Commands (V1)
 
-PC (Windows PowerShell)
-----------------------
-# Navigate to repo
-cd "D:\Documents\GitHub\Pi_Camera_Control_RnD\Pi_ai_RnD"
-pwd
-dir
-tree /f
-
-# Git (typical loop)
+## Windows (PC) — git
+cd D:\Documents\GitHub\Pi_Camera_Control_RnD
 git status
-git add .
-git commit -m "message"
+git add -A
+git commit -m "V1: update <file>"
 git push
 
-# Open common files quickly
-notepad README.md
-notepad .gitignore
-
-# If you use VS Code
-code .
-
-# SSH sanity check (non-interactive)
-ssh service@192.168.1.111 "echo OK && hostname && uptime"
-
-Pi (Terminal / SSH)
--------------------
-# SSH into the Pi (interactive)
+## Pi — pull + run
 ssh service@192.168.1.111
-
-# If Windows warns "REMOTE HOST IDENTIFICATION HAS CHANGED" (after reimage)
-ssh-keygen -R 192.168.1.111
-ssh service@192.168.1.111
-
-# Quick info checks (run on Pi after login)
-whoami
-hostname
-ip -4 addr show | grep -E "inet "
-uptime
-
-# Navigate to project
-cd ~/Pi_Camera_Control_RnD/Pi_ai_RnD
-pwd
-ls
-
-# List project tree (quick validation)
-find . -maxdepth 3 -type f | sort
-
-# Pull latest changes (repeat often)
 cd ~/Pi_Camera_Control_RnD
 git pull
-git rev-parse --short HEAD
 cd ~/Pi_Camera_Control_RnD/Pi_ai_RnD
-
-# Make scripts executable (one-time after clone)
 chmod +x scripts/*.sh
+./scripts/smoke_test.sh
+./scripts/run.sh --config configs/runtime.json --run-seconds 0 --view-size 1270x720 --debug
+tail -n 120 logs/run.log
 
-# Bootstrap / setup (one-time per fresh install)
-./scripts/pi_setup.sh
+## Packaging V1 (tag + local snapshot)
+# 1) ensure clean
+git status
 
-# Activate venv (verify)
-source .venv/bin/activate
-which python
-python -V
-pip -V
+# 2) commit final V1 state
+git add -A
+git commit -m "V1: C2-only live viewer + person bbox"
 
-# Run app (standard)
-./scripts/run.sh
-./scripts/run.sh --help
+# 3) tag + push tag
+git tag -a v1 -m "Pi_ai_RnD V1"
+git push origin v1
 
-# Run app remotely via SSH (no interactive shell)
-ssh service@192.168.1.111 "cd ~/Pi_Camera_Control_RnD/Pi_ai_RnD && ./scripts/run.sh"
+# 4) create an on-disk snapshot inside project folder (recommended: git archive)
+mkdir -p releases/V1
+git archive --format=zip --output releases/V1/Pi_ai_RnD_v1.zip HEAD
 
-# Logs
-ls -lah logs
-tail -f logs/run.log
-tail -n 200 logs/run.log
-
-# Edit files on the Pi
-nano src/pi_ai_rnd/app.py
-nano config/runtime.json
-nano config/models.json
-
-# Find files / grep
-grep -R "TODO" -n src/pi_ai_rnd
-
-Raspberry Pi camera baseline (known-good viewer)
-------------------------------------------------
-# Object detection overlay using rpicam-hello post-processing JSON
-rpicam-hello -t 0s --post-process-file /usr/share/rpi-camera-assets/imx500_mobilenet_ssd.json --viewfinder-width 1920 --viewfinder-height 1080 --framerate 30
-
-# Copy + edit JSON locally (safe way)
-mkdir -p ~/pp
-cp /usr/share/rpi-camera-assets/imx500_mobilenet_ssd.json ~/pp/imx500_mobilenet_ssd.json
-nano ~/pp/imx500_mobilenet_ssd.json
+# To restore later:
+# - preferred: git checkout v1
+# - or unzip releases/V1/Pi_ai_RnD_v1.zip into a new folder

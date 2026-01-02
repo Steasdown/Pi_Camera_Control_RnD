@@ -268,7 +268,7 @@ def _run_prototype_b(cfg: AppConfig, debug: bool, run_seconds: float) -> int:
             print("[B] camera stopped/closed")
             
 def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size: str) -> int:
-    """Prototype C2: OpenCV window with red person bbox overlay."""
+    """Prototype C2: OpenCV window with red person bbox overlay (single-request aligned)."""
     try:
         import cv2
         from picamera2 import Picamera2
@@ -282,13 +282,15 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
     try:
         w_str, h_str = view_size.lower().split("x")
         frame_w, frame_h = int(w_str), int(h_str)
+        if frame_w <= 0 or frame_h <= 0:
+            raise ValueError("non-positive size")
     except Exception:
         print(f"[C2] Bad --view-size '{view_size}'. Use e.g. 1280x720")
         return 2
 
     print("[C2] starting (OpenCV window)")
     print(f"[C2] model_path: {cfg.model_path}")
-    print(f"[C2] threshold: {cfg.score_threshold}")
+    print(f"[C2] threshold (config): {cfg.score_threshold}")
     print(f"[C2] target_class_id: {cfg.target_class_id} ({cfg.target_class_name})")
     print(f"[C2] view: {frame_w}x{frame_h}")
     print("[C2] press 'q' in the window to quit")
@@ -296,6 +298,7 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
     imx500 = IMX500(cfg.model_path)
     picam2 = Picamera2(imx500.camera_num)
 
+    # Use an RGB stream from Picamera2 (widely supported), then convert to BGR for OpenCV.
     config = picam2.create_preview_configuration(
         main={"size": (frame_w, frame_h), "format": "RGB888"},
         buffer_count=6,
@@ -305,6 +308,7 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
     window_name = "Pi AI RnD (C2)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
+    # Rate-limit terminal prints (cfg.print_hz comes from config)
     last_print = 0.0
     min_dt = 1.0 / max(0.1, float(cfg.print_hz))
 
@@ -322,33 +326,35 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                 metadata = req.get_metadata()
 
                 # Frame from the SAME request (keeps bbox aligned with image)
-                frame = req.make_array("main")  # returns numpy array in configured format
+                frame_rgb = req.make_array("main")  # numpy array in RGB888
 
                 outputs = _get_outputs(imx500, metadata)
                 norm = normalize_ssd_outputs(outputs)
             finally:
                 req.release()
 
-
-            # Convert to BGR for OpenCV display
+            # Convert to BGR for OpenCV display/drawing
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
             if norm is not None:
                 boxes, scores, classes, count = norm
                 dets = build_detections(
-                    boxes=boxes, scores=scores, classes=classes,
-                    count=count, threshold=cfg.score_threshold
+                    boxes=boxes,
+                    scores=scores,
+                    classes=classes,
+                    count=count,
+                    threshold=cfg.score_threshold,  # ONLY threshold source
                 )
                 persons = filter_by_class(dets, cfg.target_class_id)
 
                 if persons:
                     d0 = max(persons, key=lambda d: d.score)
 
-                    # Convert inference box -> pixel rect
+                    # Convert inference box -> pixel rect in this stream's coordinates
                     rect = imx500.convert_inference_coords(d0.box, metadata, picam2)
                     x, y, w, h = _rect_to_xywh(rect, frame_w, frame_h)
 
-                    # Clamp for safety
+                    # Clamp for safety (handles occasional negatives/overflows)
                     x = max(0, min(x, frame_w - 1))
                     y = max(0, min(y, frame_h - 1))
                     w = max(0, min(w, frame_w - x))
@@ -357,16 +363,23 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                     # Draw red bbox + label
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
                     cv2.putText(
-                        frame, f"person {d0.score:.2f}",
+                        frame,
+                        f"person {d0.score:.2f}",
                         (x + 5, max(20, y - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 0, 255),
+                        2,
                     )
 
-                    # Optional rate-limited console print (still useful over SSH logs)
+                    # Rate-limited console print
                     now = time.monotonic()
                     if (now - last_print) >= min_dt:
                         cx, cy = x + w / 2.0, y + h / 2.0
-                        print(f"[C2][person] score={d0.score:.2f} px=(x={x},y={y},w={w},h={h}) center=({cx:.1f},{cy:.1f})")
+                        print(
+                            f"[C2][person] score={d0.score:.2f} "
+                            f"px=(x={x},y={y},w={w},h={h}) center=({cx:.1f},{cy:.1f})"
+                        )
                         printed += 1
                         last_print = now
 
@@ -384,6 +397,7 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
         cv2.destroyAllWindows()
         if debug:
             print("[C2] camera stopped/closed")
+
 
 
 def main() -> int:

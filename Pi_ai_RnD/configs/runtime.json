@@ -1,0 +1,6 @@
+{
+  "score_threshold": 0.55,
+  "print_hz": 5.0,
+  "target_class_id": 0,
+  "target_class_name": "person"
+}

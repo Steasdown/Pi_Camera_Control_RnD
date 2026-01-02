@@ -194,9 +194,10 @@ def _run_prototype_b(cfg: AppConfig, debug: bool, run_seconds: float) -> int:
 
     # No preview window; keep main stream small
     config = picam2.create_preview_configuration(
-        main={"size": (640, 480), "format": "RGB888"},
+        main={"size": (frame_w, frame_h), "format": "BGR888"},
         buffer_count=6,
     )
+
     picam2.configure(config)
 
     # Rate limit prints for SSH
@@ -326,7 +327,6 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                 metadata = req.get_metadata()
 
                 # Frame from the SAME request (keeps bbox aligned with image)
-                frame_rgb = req.make_array("main")  # numpy array in RGB888
 
                 outputs = _get_outputs(imx500, metadata)
                 norm = normalize_ssd_outputs(outputs)
@@ -334,7 +334,8 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                 req.release()
 
             # Convert to BGR for OpenCV display/drawing
-            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            frame = req.make_array("main")   # already BGR888
+
 
             if norm is not None:
                 boxes, scores, classes, count = norm

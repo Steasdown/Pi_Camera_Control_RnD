@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Pi AI RnD (V1) — C2 Live
+Comment=Run V1 app (C2 window)
+Terminal=false
+Categories=Development;
+Icon=camera-photo
+
+# V1 repo location on the Pi
+Path=/home/service/Pi_Camera_Control_RnD/Pi_Ai_V1
+
+Exec=lxterminal -t "Pi AI RnD V1 (C2)" -e bash -lc 'cd "/home/service/Pi_Camera_Control_RnD/Pi_Ai_V1" && chmod +x scripts/*.sh && ./scripts/run.sh --config configs/runtime.json --run-c2 --run-seconds 0 --view-size 1270x720 --debug; echo; echo "[done] press Enter to close"; read'

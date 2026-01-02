@@ -269,7 +269,12 @@ def _run_prototype_b(cfg: AppConfig, debug: bool, run_seconds: float) -> int:
             print("[B] camera stopped/closed")
             
 def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size: str) -> int:
-    """Prototype C2: OpenCV window with red person bbox overlay (single-request aligned)."""
+    """Prototype C2: OpenCV window with red person bbox overlay (single-request aligned).
+    Improvements:
+    - Draw bbox EVERY frame using "latched" last detection (hold_s).
+    - Smooth bbox using EMA (alpha) to reduce jitter.
+    - Keep terminal prints rate-limited (cfg.print_hz).
+    """
     try:
         import cv2
         from picamera2 import Picamera2
@@ -299,7 +304,7 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
     imx500 = IMX500(cfg.model_path)
     picam2 = Picamera2(imx500.camera_num)
 
-    # Use an RGB stream from Picamera2 (widely supported), then convert to BGR for OpenCV.
+    # Use RGB stream; swap once for OpenCV BGR if your colours are still swapped.
     config = picam2.create_preview_configuration(
         main={"size": (frame_w, frame_h), "format": "RGB888"},
         buffer_count=6,
@@ -317,6 +322,25 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
     frames = 0
     printed = 0
 
+    # ---- smoothing / latching settings ----
+    hold_s = 0.25          # keep last bbox visible for 250 ms after last detection
+    alpha = 0.35           # EMA smoothing factor (0..1). Higher = more responsive, less smooth
+
+    # Latched + smoothed bbox state (float coords)
+    ema_xywh = None        # (x,y,w,h) floats
+    last_seen_t = -1e9
+    last_score = 0.0
+
+    def ema_update(prev, new, a: float):
+        if prev is None:
+            return new
+        return (
+            prev[0] * (1.0 - a) + new[0] * a,
+            prev[1] * (1.0 - a) + new[1] * a,
+            prev[2] * (1.0 - a) + new[2] * a,
+            prev[3] * (1.0 - a) + new[3] * a,
+        )
+
     try:
         picam2.start()
 
@@ -326,15 +350,20 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                 frames += 1
                 metadata = req.get_metadata()
 
-                # Get the frame BEFORE releasing the request
-                frame = req.make_array("main")  # numpy array in configured format (BGR888 below)
-                #frame = frame[:, :, ::-1]  # swap R<->B for OpenCV BGR
+                # Frame must be taken before release
+                frame = req.make_array("main")
+
+                # Your colours are swapped -> do exactly one swap here
+                frame = frame[:, :, ::-1]  # RGB -> BGR for OpenCV
+
                 outputs = _get_outputs(imx500, metadata)
                 norm = normalize_ssd_outputs(outputs)
             finally:
                 req.release()
 
+            now_t = time.monotonic()
 
+            # Update latched bbox if we have a detection this frame
             if norm is not None:
                 boxes, scores, classes, count = norm
                 dets = build_detections(
@@ -345,42 +374,51 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                     threshold=cfg.score_threshold,  # ONLY threshold source
                 )
                 persons = filter_by_class(dets, cfg.target_class_id)
-
                 if persons:
                     d0 = max(persons, key=lambda d: d.score)
 
-                    # Convert inference box -> pixel rect in this stream's coordinates
                     rect = imx500.convert_inference_coords(d0.box, metadata, picam2)
                     x, y, w, h = _rect_to_xywh(rect, frame_w, frame_h)
 
-                    # Clamp for safety (handles occasional negatives/overflows)
+                    # Clamp
                     x = max(0, min(x, frame_w - 1))
                     y = max(0, min(y, frame_h - 1))
-                    w = max(0, min(w, frame_w - x))
-                    h = max(0, min(h, frame_h - y))
+                    w = max(1, min(w, frame_w - x))
+                    h = max(1, min(h, frame_h - y))
 
-                    # Draw red bbox + label
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                    cv2.putText(
-                        frame,
-                        f"person {d0.score:.2f}",
-                        (x + 5, max(20, y - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 0, 255),
-                        2,
-                    )
+                    ema_xywh = ema_update(ema_xywh, (float(x), float(y), float(w), float(h)), alpha)
+                    last_seen_t = now_t
+                    last_score = float(d0.score)
 
                     # Rate-limited console print
-                    now = time.monotonic()
-                    if (now - last_print) >= min_dt:
-                        cx, cy = x + w / 2.0, y + h / 2.0
+                    if (now_t - last_print) >= min_dt:
+                        cx, cy = ema_xywh[0] + ema_xywh[2] / 2.0, ema_xywh[1] + ema_xywh[3] / 2.0
                         print(
-                            f"[C2][person] score={d0.score:.2f} "
-                            f"px=(x={x},y={y},w={w},h={h}) center=({cx:.1f},{cy:.1f})"
+                            f"[C2][person] score={last_score:.2f} "
+                            f"px=(x={int(ema_xywh[0])},y={int(ema_xywh[1])},w={int(ema_xywh[2])},h={int(ema_xywh[3])}) "
+                            f"center=({cx:.1f},{cy:.1f})"
                         )
                         printed += 1
-                        last_print = now
+                        last_print = now_t
+
+            # Draw EVERY frame while "held"
+            if ema_xywh is not None and (now_t - last_seen_t) <= hold_s:
+                x, y, w, h = (int(ema_xywh[0]), int(ema_xywh[1]), int(ema_xywh[2]), int(ema_xywh[3]))
+                x = max(0, min(x, frame_w - 1))
+                y = max(0, min(y, frame_h - 1))
+                w = max(1, min(w, frame_w - x))
+                h = max(1, min(h, frame_h - y))
+
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                cv2.putText(
+                    frame,
+                    f"person {last_score:.2f}",
+                    (x + 5, max(20, y - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                )
 
             cv2.imshow(window_name, frame)
             key = cv2.waitKey(1) & 0xFF
@@ -396,6 +434,7 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
         cv2.destroyAllWindows()
         if debug:
             print("[C2] camera stopped/closed")
+
 
 
 

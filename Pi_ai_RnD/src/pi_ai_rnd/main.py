@@ -328,7 +328,7 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
 
                 # Get the frame BEFORE releasing the request
                 frame = req.make_array("main")  # numpy array in configured format (BGR888 below)
-
+                frame = frame[:, :, ::-1]  # swap R<->B for OpenCV BGR
                 outputs = _get_outputs(imx500, metadata)
                 norm = normalize_ssd_outputs(outputs)
             finally:

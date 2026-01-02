@@ -1,0 +1,5 @@
+{
+  "_note": "PLACEHOLDER. Copy the real file from the Pi path below when convenient.",
+  "_copy_from_pi": "/usr/share/rpi-camera-assets/imx500_mobilenet_ssd.json",
+  "_usage": "Reference only (not consumed by the Python app)."
+}

@@ -1,0 +1,38 @@
+# Pi AI Camera RnD — Common Commands (V1)
+
+## Windows (PC) — git
+cd D:\Documents\GitHub\Pi_Camera_Control_RnD
+git status
+git add -A
+git commit -m "V1: update <file>"
+git push
+
+## Pi — pull + run
+ssh service@192.168.1.111
+cd ~/Pi_Camera_Control_RnD
+git pull
+cd ~/Pi_Camera_Control_RnD/Pi_ai_RnD
+chmod +x scripts/*.sh
+./scripts/smoke_test.sh
+./scripts/run.sh --config configs/runtime.json --run-seconds 0 --view-size 1270x720 --debug
+tail -n 120 logs/run.log
+
+## Packaging V1 (tag + local snapshot)
+# 1) ensure clean
+git status
+
+# 2) commit final V1 state
+git add -A
+git commit -m "V1: C2-only live viewer + person bbox"
+
+# 3) tag + push tag
+git tag -a v1 -m "Pi_ai_RnD V1"
+git push origin v1
+
+# 4) create an on-disk snapshot inside project folder (recommended: git archive)
+mkdir -p releases/V1
+git archive --format=zip --output releases/V1/Pi_ai_RnD_v1.zip HEAD
+
+# To restore later:
+# - preferred: git checkout v1
+# - or unzip releases/V1/Pi_ai_RnD_v1.zip into a new folder

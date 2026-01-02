@@ -1,0 +1,22 @@
+# runtime artifacts
+logs/
+*.log
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# release artifacts (optional)
+releases/**/*.zip
+releases/**/*.tar.gz

@@ -353,9 +353,6 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                 # Frame must be taken before release
                 frame = req.make_array("main")
 
-                # Your colours are swapped -> do exactly one swap here
-                frame = frame[:, :, ::-1]  # RGB -> BGR for OpenCV
-
                 outputs = _get_outputs(imx500, metadata)
                 norm = normalize_ssd_outputs(outputs)
             finally:

@@ -87,7 +87,7 @@ def _probe_imx500_once(cfg: AppConfig, debug: bool, timeout_s: float, poll_hz: f
     picam2 = Picamera2(imx500.camera_num)
 
     config = picam2.create_preview_configuration(
-        main={"size": (640, 480), "format": "RGB888"},
+        main={"size": (1920, 1080), "format": "RGB888"},
         buffer_count=4,
     )
     picam2.configure(config)
@@ -316,18 +316,19 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
         picam2.start()
 
         while time.monotonic() < deadline:
-            # Get a frame to display (RGB)
-            frame_rgb = picam2.capture_array("main")
-            frames += 1
-
-            # Also grab metadata for detections
             req = picam2.capture_request()
             try:
+                frames += 1
                 metadata = req.get_metadata()
+
+                # Frame from the SAME request (keeps bbox aligned with image)
+                frame = req.make_array("main")  # returns numpy array in configured format
+
                 outputs = _get_outputs(imx500, metadata)
                 norm = normalize_ssd_outputs(outputs)
             finally:
                 req.release()
+
 
             # Convert to BGR for OpenCV display
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)

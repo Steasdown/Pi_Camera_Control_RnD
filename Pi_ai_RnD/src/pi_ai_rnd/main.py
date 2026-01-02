@@ -301,7 +301,7 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
 
     # Use an RGB stream from Picamera2 (widely supported), then convert to BGR for OpenCV.
     config = picam2.create_preview_configuration(
-        main={"size": (frame_w, frame_h), "format": "RGB888"},
+        main={"size": (frame_w, frame_h), "format": "BGR888"},
         buffer_count=6,
     )
     picam2.configure(config)
@@ -326,15 +326,13 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                 frames += 1
                 metadata = req.get_metadata()
 
-                # Frame from the SAME request (keeps bbox aligned with image)
+                # Get the frame BEFORE releasing the request
+                frame = req.make_array("main")  # numpy array in configured format (BGR888 below)
 
                 outputs = _get_outputs(imx500, metadata)
                 norm = normalize_ssd_outputs(outputs)
             finally:
                 req.release()
-
-            # Convert to BGR for OpenCV display/drawing
-            frame = req.make_array("main")   # already BGR888
 
 
             if norm is not None:

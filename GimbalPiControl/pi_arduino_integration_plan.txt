@@ -1,0 +1,424 @@
+PI ↔ ARDUINO INTEGRATION PLAN (USB SERIAL)
+
+Goal
+- Combine the Pi people-detection pipeline with the Arduino stepper pan controller.
+- USB serial simulates the long-distance link for now.
+- Final behaviour: in Arduino AUTO mode, the Pi drives pan speed to keep a detected person centered.
+
+Context (current)
+- Pi app (main.py):
+  - Runs IMX500 + Picamera2
+  - Shows an OpenCV window
+  - Draws a red bbox overlay
+  - Prints bbox center coordinates to stdout
+- Arduino app (GimbalJSControl.ino):
+  - State machine: ORIENT / MANUAL / HOME / AUTO
+  - Joystick input + sensitivity
+  - Soft limits + enable/hold
+  - Prints a periodic telemetry line (~10 Hz) plus event lines
+
+Integration principles (keep these true at every step)
+1) One-directional first (Arduino → Pi), then bidirectional (Pi → Arduino).
+2) Line-oriented protocol: one message per line, '\n' terminated.
+3) Separation of responsibility:
+   - Arduino owns real-time stepping + safety limits.
+   - Pi owns perception + higher-level decisions.
+4) Safety watchdog for Pi-driven motion:
+   - If command stream stops, Arduino decelerates to 0 and stops driving.
+
+Repository workflow (PC → Pi via git)
+- Create a branch per step (step1-serial-view, step2-parse, ...).
+- Each step ends with:
+  - Unit tests passing on PC (mocked hardware).
+  - A short hardware integration test.
+  - A tagged commit (e.g., v0.1-step1).
+
+----------------------------------------
+Step 0 — Freeze a serial “contract”
+----------------------------------------
+
+Objective
+- Define exactly what Arduino prints and what Pi relies on.
+- Avoid parsing ambiguity later.
+
+Actions
+A) Identify Arduino output types
+- Telemetry line (periodic): currently of the form
+  "STATE:MANUAL | EN:1 | HOLD:0 | ... | steps:<n> deg:<f> | tgtSpd:<f> curSpd:<f> | ..."
+- Event lines: start with "[EVENT]", "[STATE]", "[BOOT]".
+
+B) Decide what Pi needs as minimum fields
+- state/mode: ORIENT / MANUAL / HOME / AUTO
+- sensitivity level
+- position (steps-from-home and degrees)
+- driver enable and hold states
+- current speed and target speed
+
+C) Reserve command words for Step 3 (document now)
+- MODE <MANUAL|AUTO_SWEEP|AUTO_PI>
+- PANSPD <steps_per_sec>
+- STOP
+- HOME
+- STATUS?
+- Arduino response lines:
+  - OK <cmd>
+  - ERR <reason>
+
+Unit test assets (prep)
+- Capture ~50 lines of real Arduino output into a text file (golden log).
+- Include both telemetry and event lines.
+
+Exit criteria
+- Add a short spec file in repo (e.g., docs/serial_contract.md):
+  - telemetry format + required keys
+  - event line prefixes
+  - reserved commands + ack format
+
+--------------------------------------------------------------
+
+--------------------------------------------------------------
+
+--------------------------------------------------------------
+
+--------------------------------------------------------------
+
+--------------------------------------------------------------
+
+--------------------------------------------------------------
+
+--------------------------------------------------------------
+
+--------------------------------------------------------------
+
+--------------------------------------------------------------
+Step 1 — Display raw Arduino serial output on the Pi GUI (read)
+--------------------------------------------------------------
+
+Objective
+- Prove reliable USB serial connection from Pi app to Arduino.
+- Show last N raw serial lines on the OpenCV window (no parsing yet).
+
+Implementation tasks (Pi)
+1) Add a serial reader component
+   - Open the Arduino serial port at 115200.
+   - Read full lines and push them into a ring buffer (keep the last 20–50 lines).
+   - Track link state: CONNECTED/DISCONNECTED and last-line timestamp.
+   - Handle disconnect/reconnect cleanly (USB unplug / replug).
+
+2) Display the ring buffer on the OpenCV window
+   - Add a simple text panel overlay (top-left or bottom-left).
+   - Show:
+     - Serial status
+     - Last N lines (truncate to fit)
+     - Line rate (optional)
+
+3) Add a config toggle to enable/disable serial
+   - Needed because PC dev will not have the Arduino port.
+
+Unit tests (PC, no hardware)
+- Create a FakeSerial source that replays lines from a text file.
+- Tests:
+  - Ring buffer keeps exactly N lines.
+  - Disconnect sets state DISCONNECTED.
+  - Reconnect resumes reading.
+
+Hardware integration test
+- On Pi desktop/VNC, run the app with Arduino connected:
+  - Confirm raw Arduino lines appear in the GUI.
+  - Unplug USB and confirm the app stays alive and shows DISCONNECTED.
+  - Replug USB and confirm it reconnects.
+
+Exit criteria
+- Live Arduino serial output is visible in the Pi GUI.
+- No parsing and no motor commands sent.
+
+--------------------------------------------------------------
+Step 2 — Parse Arduino telemetry into structured fields
+--------------------------------------------------------------
+
+Objective
+- Extract fields from the periodic Arduino telemetry line into a structured object.
+- Display key fields in a clean HUD overlay while still showing the raw log panel.
+
+Implementation tasks (Pi)
+1) Telemetry filter
+   - Treat lines beginning with "STATE:" as telemetry.
+   - Ignore event lines that begin with "[EVENT]", "[STATE]", "[BOOT]".
+
+2) Parser
+   - Split telemetry by "|".
+   - For each segment, split on the first ":" to get key/value.
+   - Trim whitespace.
+   - Convert to types where safe:
+     - EN / HOLD / homed -> bool
+     - sens -> int
+     - steps -> int
+     - deg / tgtSpd / curSpd / accel -> float
+   - Maintain "last_good_telemetry" + "telemetry_age_ms".
+   - Never throw: malformed lines should be dropped with a debug counter.
+
+3) Telemetry model
+   - Represent at minimum:
+     - state (ORIENT/MANUAL/HOME/AUTO)
+     - sensLevel
+     - holdEnable
+     - driverEnable
+     - steps
+     - deg
+     - tgtSpd
+     - curSpd
+     - timestamp
+
+4) GUI overlay (HUD)
+   - Add a compact block showing:
+     - Mode/state
+     - Sens level
+     - Position (deg + steps)
+     - Speed (tgt/current)
+     - Hold + Enable status
+     - Telemetry age (ms)
+
+Unit tests (PC)
+- Parser golden tests
+  - Build a test file containing representative telemetry lines copied from Serial Monitor.
+  - Assert each required field parses correctly.
+- Robustness tests
+  - Feed corrupted lines (missing separators, missing keys, non-numeric values).
+  - Assert the parser returns None or partial without throwing.
+- Regression guard
+  - If the Arduino output format changes, the golden tests should fail noisily.
+
+Hardware integration test
+- With Arduino connected:
+  - Toggle modes and sensitivity and confirm HUD updates.
+  - Move joystick and confirm speed/position updates.
+  - Verify telemetry_age_ms stays low (typically < 300 ms).
+
+Exit criteria
+- Pi HUD shows stable, parsed telemetry fields.
+- Raw serial panel remains available for debugging.
+
+--------------------------------------------------------------
+Step 3 — Update Arduino AUTO mode so Pi can command motor
+--------------------------------------------------------------
+
+Objective
+- Extend Arduino AUTO mode to include a Pi-driven submode (AUTO_PI) without breaking existing joystick/manual behaviour.
+- Keep AUTO_SWEEP as a standalone mode for testing.
+
+Arduino changes (high level)
+1) Define AUTO submodes
+   - AUTO_SWEEP: existing left↔right sweep at AUTO_SPEED.
+   - AUTO_PI: targetSpeed comes from serial commands.
+
+2) Add a serial command parser (line-oriented ASCII)
+   - Suggested commands (minimum viable set):
+     - MODE AUTO_SWEEP
+     - MODE AUTO_PI
+     - MODE MANUAL
+     - PANSPD <signed_steps_per_sec>
+     - STOP
+     - STATUS?
+   - Suggested responses:
+     - OK <cmd>
+     - ERR <reason>
+
+3) Add a watchdog timeout for AUTO_PI (safety)
+   - Maintain last_cmd_time.
+   - If no valid PANSPD received within a timeout (e.g., 300–500 ms):
+     - ramp speed to 0
+     - keep enable asserted only if holdEnable is true (or always keep enabled if you prefer)
+
+4) Preserve existing safety constraints
+   - Always enforce ±LIMIT_STEPS regardless of command.
+   - Clamp max commanded speed to a safe ceiling.
+
+5) Telemetry updates
+   - Add fields to the periodic telemetry line:
+     - autoSubmode=AUTO_SWEEP/AUTO_PI
+     - cmdAgeMs
+     - lastCmd (optional)
+   - Keep existing keys stable so Step 2 parser does not break.
+
+Arduino test procedure (Serial Monitor)
+- Manual command tests (repeatable checklist):
+  1) Put into MODE AUTO_PI, send PANSPD 0: motor should stop.
+  2) PANSPD +300 then PANSPD -300: direction should flip.
+  3) Drive to each limit and ensure commands do not push beyond.
+  4) Stop sending PANSPD: watchdog ramps to 0 within timeout.
+  5) MODE MANUAL restores joystick control.
+- Record a “command transcript” text log for future regression.
+
+Exit criteria
+- Arduino accepts serial commands reliably.
+- AUTO_PI behaves safely on command loss.
+
+--------------------------------------------------------------
+Step 3b — Pi keyboard controls motor (in AUTO_PI only)
+--------------------------------------------------------------
+
+Objective
+- Prove bidirectional integration by controlling pan speed from the Pi using keyboard inputs.
+- Keep this separate from vision-based control.
+
+Pi changes (high level)
+1) Outbound command emitter
+   - Send commands only when telemetry indicates Arduino is in AUTO_PI.
+   - Rate limit command send (e.g., 10–20 Hz).
+   - Maintain a “last command sent” value for GUI display.
+
+2) Keyboard mapping
+   - Left key: send PANSPD negative
+   - Right key: send PANSPD positive
+   - No key: send PANSPD 0 (or STOP)
+   - Optional: space = STOP
+   - Optional: key to request MODE AUTO_PI (for convenience)
+
+3) GUI
+   - Display:
+     - AutoSubmode
+     - Commanded speed
+     - Connection/telemetry age
+
+Unit tests (PC)
+- Mock the serial output channel and assert the exact command lines produced.
+- Rate-limit test: hold key down, ensure output frequency stays within limit.
+- Mode gating test: if telemetry state != AUTO_PI, ensure no PANSPD is sent.
+
+Hardware integration test
+- On Pi with Arduino connected:
+  - Put Arduino into AUTO_PI.
+  - Use keyboard to pan left/right and verify motion.
+  - Verify releasing the key results in stop.
+  - Unplug USB and confirm Arduino watchdog stops motion.
+
+Exit criteria
+- Pi can command pan speed over USB safely and repeatably.
+
+--------------------------------------------------------------
+Step 4 — Draft vision integration (advisory only)
+--------------------------------------------------------------
+
+Objective
+- Use detection output to compute and display guidance (LEFT/RIGHT/CENTERED) without moving the motor.
+- Guidance is only active when Arduino is in AUTO_PI.
+
+Pi changes (high level)
+1) Define tracking error
+   - frame_center_x = frame_w / 2
+   - error_px = bbox_center_x - frame_center_x
+   - error_norm = error_px / (frame_w / 2)
+
+2) Guidance thresholds
+   - deadband_px (example: 15–30 px)
+   - If error_px > deadband_px: show “MOVE RIGHT”
+   - If error_px < -deadband_px: show “MOVE LEFT”
+   - Else: “CENTERED”
+
+3) GUI overlay
+   - Display:
+     - error_px / error_norm
+     - guidance direction
+     - tracking active/inactive status
+
+Unit tests (PC)
+- Pure function tests: bbox center input → guidance output.
+- Boundary tests: exactly at deadband.
+- Stability test: sequence with jitter near center does not flicker excessively (use hysteresis if needed).
+
+Hardware integration test
+- With a person moving across frame, confirm guidance matches expected direction.
+- Confirm that no PANSPD commands are sent in this step.
+
+Exit criteria
+- Guidance is correct and stable.
+
+--------------------------------------------------------------
+Step 4b — Full closed-loop tracking (Pi drives motor)
+--------------------------------------------------------------
+
+Objective
+- Convert vision error into a commanded pan speed and send it to Arduino in AUTO_PI.
+- Keep behaviour stable, bounded, and safe.
+
+Pi control design (incremental)
+1) Start with proportional control (P-only)
+   - pan_speed = Kp * error_norm
+   - Clamp to [-PANSPD_MAX, +PANSPD_MAX]
+   - Apply deadband: if |error_px| < deadband_px → pan_speed = 0
+
+2) Add smoothing / rate limiting
+   - Low-pass filter the commanded speed and/or limit delta per update.
+   - Maintain fixed command update rate (e.g., 10–20 Hz).
+
+3) Lost target behaviour
+   - If no detection for N frames or a timeout:
+     - send PANSPD 0
+     - keep hold enabled (optional)
+     - optionally after longer timeout: return home (future)
+
+4) Safety and tuning
+   - Keep PANSPD_MAX conservative initially.
+   - Increase Kp gradually until tracking is responsive but not oscillatory.
+   - Log error_px and pan_speed for tuning.
+
+Unit tests (PC)
+- Controller mapping tests: error_norm → pan_speed with clamp/deadband.
+- Timing tests: ensure command refresh interval is always under Arduino watchdog timeout.
+- Optional simulation test (recommended):
+  - Implement a simple plant approximation where pan speed reduces error over time.
+  - Verify convergence into deadband without sustained oscillation.
+
+Hardware integration test (staged)
+1) Conservative settings
+   - Low PANSPD_MAX, low Kp.
+   - Confirm the camera moves the correct direction.
+2) Stationary subject
+   - Confirm it centers smoothly and holds within deadband.
+3) Moving subject
+   - Confirm it tracks with acceptable lag.
+4) Failure modes
+   - Unplug USB: Arduino watchdog must stop motion.
+   - Push to limits: Arduino must enforce soft limit regardless of Pi commands.
+
+Exit criteria
+- With AUTO_PI enabled, the system keeps a person centered automatically.
+- Safety behaviours are validated.
+
+--------------------------------------------------------------
+Suggested unit test layout (Pi repo)
+--------------------------------------------------------------
+- tests/test_serial_reader.py
+  - FakeSerial line source → ring buffer + connection status
+- tests/test_telemetry_parser.py
+  - Golden telemetry lines → parsed model
+- tests/test_command_emitter.py
+  - Key inputs + gating → command strings + rate limiting
+- tests/test_guidance.py
+  - bbox center → LEFT/RIGHT/CENTERED
+- tests/test_controller.py
+  - error → speed mapping + clamp + deadband + smoothing
+
+Test data assets
+- testdata/arduino_golden_log.txt
+- testdata/arduino_command_transcript.txt
+- testdata/bbox_center_sequences.csv (optional)
+
+--------------------------------------------------------------
+Operational checklists (repeatable)
+--------------------------------------------------------------
+
+Pi-side serial sanity
+- Port opens at 115200.
+- Telemetry age stays low (< 300 ms typical).
+- Disconnect/reconnect does not crash.
+
+Arduino-side control safety
+- AUTO_PI obeys limits.
+- Watchdog stops motor on command loss.
+- MODE switching never produces runaway motion.
+
+Tracking acceptance (Step 4b)
+- No oscillation at center (deadband working).
+- Commanded speed not saturating constantly.
+- Lost target stops motion reliably.

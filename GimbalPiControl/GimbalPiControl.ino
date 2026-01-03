@@ -11,15 +11,17 @@ ezButton btn1(PIN_BTN1);
 ezButton btn2(PIN_BTN2);
 
 // ----------------- STATE MACHINE -----------------
-enum State { ORIENTATION, MANUAL, RETURN_HOME, AUTO };
+enum State { ORIENTATION, MANUAL, RETURN_HOME, PI_CONTROL };
 static State state = ORIENTATION;
 
 static bool homed = false;
 static int  sensLevel = 3;     // 1..5
-static int  autoDir = +1;      // +1 -> +limit, -1 -> -limit
 
 // Hold enable (keeps driver enabled in MANUAL even when joystick released)
 static bool holdEnable = false;
+
+// PI_CONTROL: speed command from Pi (steps/sec, signed)
+static float piTargetSpeed = 0.0f;
 
 // Joystick center calibration
 static int xCenter = 512;
@@ -34,7 +36,7 @@ static unsigned long lastPrintMs = 0;
 
 // ----------------- MODULES -----------------
 MotorControl motor;
-PiCommunication piComm; // reserved for later (NOT used yet)
+PiCommunication piComm;
 
 // ----------------- HELPERS -----------------
 static const char* stateName(State s) {
@@ -42,13 +44,19 @@ static const char* stateName(State s) {
     case ORIENTATION: return "ORIENT";
     case MANUAL:      return "MANUAL";
     case RETURN_HOME: return "HOME";
-    case AUTO:        return "AUTO";
+    case PI_CONTROL:  return "PICTRL";
     default:          return "?";
   }
 }
 
 static void transitionTo(State next) {
   if (state != next) {
+    // On leaving PI_CONTROL, stop motion for safety
+    if (state == PI_CONTROL) {
+      piTargetSpeed = 0.0f;
+      piComm.clear();
+    }
+
     state = next;
     Serial.print(F("[STATE] -> "));
     Serial.println(stateName(state));
@@ -86,6 +94,66 @@ static float joystickToSpeed(int xRaw, int xC, float maxSpeed) {
   return frac * maxSpeed;
 }
 
+static bool eqI(const char* a, const char* b) {
+  while (*a && *b) {
+    char ca = *a++;
+    char cb = *b++;
+    if (ca >= 'a' && ca <= 'z') ca -= 32;
+    if (cb >= 'a' && cb <= 'z') cb -= 32;
+    if (ca != cb) return false;
+  }
+  return (*a == '\0' && *b == '\0');
+}
+
+static void handlePiCommandsOnlyInPiControl() {
+  // Only read/act on commands when in PI_CONTROL
+  if (state != PI_CONTROL) return;
+
+  piComm.update();
+  if (!piComm.hasCommand()) return;
+
+  PiCommand c = piComm.lastCmd();
+  piComm.clear();
+
+  switch (c.type) {
+    case PiCommandType::PANSPD:
+      // Store speed; applied by PI_CONTROL state below
+      piTargetSpeed = c.value;
+      break;
+
+    case PiCommandType::STOP:
+      piTargetSpeed = 0.0f;
+      break;
+
+    case PiCommandType::HOME:
+      motor.setCurrentPosition(0);
+      homed = true;
+      holdEnable = false;
+      piTargetSpeed = 0.0f;
+      motor.resetRamp();
+      motor.setDriverEnable(false);
+      Serial.println(F("[EVENT] HOME set (pos=0) [PI]."));
+      transitionTo(MANUAL);
+      break;
+
+    case PiCommandType::MODE:
+      // Support earlier plan strings as well
+      if (eqI(c.arg0, "MANUAL")) {
+        if (homed) transitionTo(MANUAL);
+      } else if (eqI(c.arg0, "AUTO_PI") || eqI(c.arg0, "PICTRL") || eqI(c.arg0, "PI_CONTROL")) {
+        if (homed) transitionTo(PI_CONTROL);
+      }
+      break;
+
+    case PiCommandType::STATUS:
+      // No extra output here (telemetry already periodic)
+      break;
+
+    default:
+      break;
+  }
+}
+
 // ----------------- SETUP -----------------
 void setup() {
   Serial.begin(115200);
@@ -116,9 +184,6 @@ void setup() {
 
 // ----------------- LOOP -----------------
 void loop() {
-  // NOTE: piComm.update() intentionally NOT called to preserve current behaviour.
-  // piComm.update();
-
   // Update buttons
   joySW.loop();
   rockL.loop();
@@ -149,12 +214,13 @@ void loop() {
 
   // Joystick button behaviour:
   // - In ORIENT: set HOME and go MANUAL
-  // - In MANUAL: toggle HOLD enable (keep motor energized when stick released)
+  // - In MANUAL: toggle HOLD enable
   if (joySW.isPressed()) {
     if (state == ORIENTATION) {
       motor.setCurrentPosition(0);
       homed = true;
-      holdEnable = false;   // matches your current sketch
+      holdEnable = false;
+      piTargetSpeed = 0.0f;
       motor.resetRamp();
       motor.setDriverEnable(false);
       Serial.println(F("[EVENT] HOME set (pos=0)."));
@@ -176,29 +242,31 @@ void loop() {
     }
   }
 
-  // Auto toggle
+  // Button 2 now toggles PI_CONTROL (replaces AUTO)
   if (btn2.isPressed()) {
     if (!homed) {
-      Serial.println(F("[EVENT] Auto ignored (not homed)."));
+      Serial.println(F("[EVENT] PiControl ignored (not homed)."));
     } else {
-      if (state == AUTO) {
-        Serial.println(F("[EVENT] Auto OFF."));
+      if (state == PI_CONTROL) {
+        Serial.println(F("[EVENT] PiControl OFF."));
+        piTargetSpeed = 0.0f;
         transitionTo(MANUAL);
       } else {
-        Serial.println(F("[EVENT] Auto ON."));
-        long p = motor.currentPosition();
-        if (p >= LIMIT_STEPS) autoDir = -1;
-        else if (p <= -LIMIT_STEPS) autoDir = +1;
-        transitionTo(AUTO);
+        Serial.println(F("[EVENT] PiControl ON."));
+        piTargetSpeed = 0.0f;
+        transitionTo(PI_CONTROL);
       }
     }
   }
+
+  // Enable pi comm only in PI_CONTROL mode
+  handlePiCommandsOnlyInPiControl();
 
   // Compute command by state
   long pos = motor.currentPosition();
   float sensMul = (float)sensLevel / 5.0f;
 
-  bool driverEnable = false;
+  bool  driverEnable = false;
   float newTarget = 0.0f;
 
   float accel_s2 = accelForSens(sensLevel);
@@ -219,7 +287,6 @@ void loop() {
       driverEnable = joyActive || holdEnable;
       newTarget = joyActive ? joystickToSpeed(xUse, xCenter, BASE_MAX_SPEED * sensMul) : 0.0f;
 
-      // Enforce +/- limit
       if (pos >= LIMIT_STEPS && newTarget > 0) newTarget = 0;
       if (pos <= -LIMIT_STEPS && newTarget < 0) newTarget = 0;
     } break;
@@ -237,47 +304,41 @@ void loop() {
       }
     } break;
 
-    case AUTO: {
+    case PI_CONTROL: {
+      // Pi owns movement. No auto sweep.
       driverEnable = true;
 
-      if (pos >= LIMIT_STEPS) autoDir = -1;
-      if (pos <= -LIMIT_STEPS) autoDir = +1;
+      // Optional: let sensitivity cap max speed
+      float maxPi = BASE_MAX_SPEED * sensMul;
+      newTarget = piTargetSpeed;
+      if (newTarget >  maxPi) newTarget =  maxPi;
+      if (newTarget < -maxPi) newTarget = -maxPi;
 
-      newTarget = (float)autoDir * AUTO_SPEED;
+      if (pos >= LIMIT_STEPS && newTarget > 0) newTarget = 0;
+      if (pos <= -LIMIT_STEPS && newTarget < 0) newTarget = 0;
     } break;
   }
 
-  // Apply enable + ramped speed (identical behaviour)
   motor.apply(driverEnable, newTarget, accel_s2);
 
-  // Serial status
+  // Serial status (condensed)
   unsigned long now = millis();
   if (now - lastPrintMs >= PRINT_PERIOD_MS) {
     lastPrintMs = now;
 
     float deg = motor.degFromSteps(pos);
 
-    Serial.print(F("STATE:")); Serial.print(stateName(state));
-    Serial.print(F(" | EN:")); Serial.print(driverEnable ? "1" : "0");
-    Serial.print(F(" | HOLD:")); Serial.print(holdEnable ? "1" : "0");
-
-    Serial.print(F(" | X:")); Serial.print(xRaw);
-    Serial.print(F(" Y:")); Serial.print(yRaw);
-    Serial.print(F(" | Xc:")); Serial.print(xCenter);
-
-    Serial.print(F(" | sens:")); Serial.print(sensLevel);
-    Serial.print(F(" | accel:")); Serial.print(accel_s2, 0);
-
-    Serial.print(F(" | steps:")); Serial.print(pos);
-    Serial.print(F(" deg:")); Serial.print(deg, 1);
-
-    Serial.print(F(" | tgtSpd:")); Serial.print(motor.targetSpeed(), 1);
-    Serial.print(F(" curSpd:")); Serial.print(motor.currentSpeed(), 1);
-
-    Serial.print(F(" | JSW:")); Serial.print(digitalRead(PIN_JOY_SW) == LOW ? "1" : "0");
-    Serial.print(F(" B1:"));  Serial.print(digitalRead(PIN_BTN1) == LOW ? "1" : "0");
-    Serial.print(F(" B2:"));  Serial.print(digitalRead(PIN_BTN2) == LOW ? "1" : "0");
-    Serial.print(F(" RL:"));  Serial.print(digitalRead(PIN_ROCK_L) == LOW ? "1" : "0");
-    Serial.print(F(" RR:"));  Serial.println(digitalRead(PIN_ROCK_R) == LOW ? "1" : "0");
+    Serial.print(F("T,"));
+    Serial.print(stateName(state));
+    Serial.print(F(","));
+    Serial.print(sensLevel);
+    Serial.print(F(","));
+    Serial.print(driverEnable ? 1 : 0);
+    Serial.print(F(","));
+    Serial.print(holdEnable ? 1 : 0);
+    Serial.print(F(","));
+    Serial.print(pos);
+    Serial.print(F(","));
+    Serial.println(deg, 1);
   }
 }

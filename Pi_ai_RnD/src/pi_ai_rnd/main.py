@@ -234,14 +234,14 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
             try:
                 frames += 1
                 metadata = req.get_metadata()
+
+                # Frame must be taken before release
+                frame = req.make_array("main")
+
                 outputs = _get_outputs(imx500, metadata)
                 norm = normalize_ssd_outputs(outputs)
-                frame_rgb = req.make_array("main")
             finally:
                 req.release()
-
-            frame_rgb = np.ascontiguousarray(frame_rgb)
-            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
             serial_status, serial_lines = poller.poll()
             draw_text_panel(

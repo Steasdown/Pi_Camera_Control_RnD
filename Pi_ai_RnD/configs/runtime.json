@@ -8,5 +8,11 @@
   "view_size": "1270x720",
 
   "ema_alpha": 0.35,
-  "hold_s": 0.25
+  "hold_s": 0.25,
+
+  "serial_enabled": true,
+  "serial_port": "auto",
+  "serial_baud": 115200,
+  "serial_lines": 30,
+  "serial_reconnect_s": 1.0
 }

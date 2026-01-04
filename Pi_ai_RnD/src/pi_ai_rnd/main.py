@@ -244,13 +244,25 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                 req.release()
 
             serial_status, serial_lines = poller.poll()
+
+            # --- Serial display rules (Stage2 Step1 GUI) ---
+            # 1) bottom of screen
+            # 2) show ONLY last 3 lines
+            # 3) hide any lines containing RGB/BGR tokens
+            serial_lines_disp = [
+                l for l in serial_lines
+                if ("RGB" not in l) and ("BGR" not in l) and ("rgb" not in l) and ("bgr" not in l)
+            ][-3:]
+
             draw_text_panel(
                 frame,
                 title="Arduino serial (raw)",
                 status=serial_status,
-                lines=serial_lines,
-                max_lines=cfg.serial_lines,
+                lines=serial_lines_disp,
+                max_lines=3,
+                anchor="bottom_left",
             )
+
 
             now_t = time.monotonic()
 
@@ -295,6 +307,20 @@ def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size
                     (0, 0, 255),
                     2,
                 )
+                # --- GUI coords HUD (updates every frame while bbox is held) ---
+                cx, cy = x + w / 2.0, y + h / 2.0
+                hud = f"x={x} y={y}  cx={cx:.0f} cy={cy:.0f}  w={w} h={h}  s={last_score:.2f}"
+                cv2.putText(
+                    frame,
+                    hud,
+                    (10, 25),  # top-left, away from bottom serial panel
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
 
             cv2.imshow(window_name, frame)
             key = cv2.waitKey(1) & 0xFF

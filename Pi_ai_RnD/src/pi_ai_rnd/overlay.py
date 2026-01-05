@@ -1,84 +1,99 @@
-"""pi_ai_rnd.overlay — drawing and geometry helpers."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Tuple
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
 
 
-@dataclass(frozen=True)
-class Rect:
-    x: int
-    y: int
-    w: int
-    h: int
+@dataclass
+class OverlayState:
+    # last detection (latched)
+    last_xywh: Optional[Tuple[int, int, int, int]] = None
+    last_score: float = 0.0
+    last_dx_px: float = 0.0
 
 
-def clamp_xywh(x: int, y: int, w: int, h: int, frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
-    x = max(0, min(int(x), frame_w - 1))
-    y = max(0, min(int(y), frame_h - 1))
-    w = max(1, min(int(w), frame_w - x))
-    h = max(1, min(int(h), frame_h - y))
-    return x, y, w, h
+def _draw_filled_circle(img, center, r, bgr):
+    cv2.circle(img, center, r, bgr, thickness=-1, lineType=cv2.LINE_AA)
 
 
-def draw_text_panel(
-    frame,
-    title: str,
-    status: str,
-    lines: Iterable[str],
+def _draw_serial_box(img: np.ndarray, lines: List[str], max_lines: int = 3) -> None:
+    h, w = img.shape[:2]
+    lines = (lines or [])[-max_lines:]
+
+    pad = 10
+    line_h = 22
+    box_h = pad * 2 + line_h * max(1, len(lines))
+    y0 = h - box_h
+    if y0 < 0:
+        y0 = 0
+
+    # solid black box
+    cv2.rectangle(img, (0, y0), (w, h), (0, 0, 0), thickness=-1)
+
+    y = y0 + pad + line_h - 6
+    for s in lines:
+        cv2.putText(img, s[:120], (pad, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        y += line_h
+
+
+def draw_overlay(
+    frame_bgr: np.ndarray,
     *,
-    anchor: str = "top_left",   # "top_left" | "bottom_left"
-    margin: int = 10,
-    max_lines: int = 30,
-    line_height: int = 18,
+    pi_control: bool,
+    bbox_xywh: Optional[Tuple[int, int, int, int]],
+    score: float,
+    dx_px: float,
+    serial_lines: List[str],
 ) -> None:
     """
-    Draw a simple text panel (solid background).
-
-    anchor:
-      - "top_left": panel starts near the top-left
-      - "bottom_left": panel sits above the bottom edge (doesn't grow downward)
+    Draws:
+      - green circle when pi_control True
+      - bbox + label (if bbox provided)
+      - dx indicator (pixels from centre)
+      - serial box at bottom with last 3 lines
     """
-    try:
-        import cv2
-    except Exception:
-        return
+    h, w = frame_bgr.shape[:2]
 
-    frame_h, frame_w = frame.shape[:2]
-
-    # Collect lines (cap to max_lines)
-    lines_list = list(lines)[-max_lines:]
-    header = [title, status]
-    all_lines = header + lines_list
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.5
-    thickness = 1
-
-    max_w = 0
-    for t in all_lines:
-        (tw, _), _ = cv2.getTextSize(t, font, font_scale, thickness)
-        max_w = max(max_w, tw)
-
-    pad = 8
-    panel_w = max_w + pad * 2
-    panel_h = len(all_lines) * line_height + pad * 2
-
-    if anchor == "bottom_left":
-        x0 = margin
-        y_top = max(margin, frame_h - margin - panel_h)
+    # PI_CONTROL indicator (top-left)
+    if pi_control:
+        _draw_filled_circle(frame_bgr, (24, 24), 10, (0, 255, 0))
+        cv2.putText(frame_bgr, "PICTRL", (42, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
     else:
-        x0 = margin
-        y_top = margin
+        cv2.circle(frame_bgr, (24, 24), 10, (120, 120, 120), thickness=2, lineType=cv2.LINE_AA)
+        cv2.putText(frame_bgr, "PICTRL", (42, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160, 160, 160), 1, cv2.LINE_AA)
 
-    # Background
-    cv2.rectangle(frame, (x0, y_top), (x0 + panel_w, y_top + panel_h), (0, 0, 0), -1)
+    # centre line
+    cx = w // 2
+    cv2.line(frame_bgr, (cx, 0), (cx, h), (80, 80, 80), 1, cv2.LINE_AA)
 
-    # Text
-    y = y_top + pad + line_height - 6
-    for i, t in enumerate(all_lines):
-        color = (255, 255, 255) if i < 2 else (200, 200, 200)
-        cv2.putText(frame, t, (x0 + pad, y), font, font_scale, color, thickness, cv2.LINE_AA)
-        y += line_height
+    # bbox
+    if bbox_xywh is not None:
+        x, y, bw, bh = bbox_xywh
+        cv2.rectangle(frame_bgr, (x, y), (x + bw, y + bh), (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(
+            frame_bgr,
+            f"person {score:.2f}",
+            (x + 6, max(24, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
+    # dx readout (top-centre)
+    cv2.putText(
+        frame_bgr,
+        f"dx_px={dx_px:+.1f}",
+        (cx - 80, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    _draw_serial_box(frame_bgr, serial_lines, max_lines=3)

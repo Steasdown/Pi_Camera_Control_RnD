@@ -1,18 +1,16 @@
 {
-  "model_path": "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk",
   "score_threshold": 0.55,
   "print_hz": 5.0,
   "target_class_id": 0,
   "target_class_name": "person",
 
-  "view_size": "1270x720",
-
-  "ema_alpha": 0.35,
-  "hold_s": 0.25,
-
-  "serial_enabled": true,
-  "serial_port": "auto",
+  "serial_port": "/dev/ttyACM0",
   "serial_baud": 115200,
-  "serial_lines": 30,
-  "serial_reconnect_s": 1.0
+
+  "pan_deadband_px": 50,
+  "pan_kp": 4.0,
+  "pan_max_speed": 900.0,
+  "pan_min_speed": 120.0,
+  "pan_send_hz": 10.0,
+  "pan_invert": false
 }

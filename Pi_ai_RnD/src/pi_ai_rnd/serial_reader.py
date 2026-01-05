@@ -1,175 +1,187 @@
-"""
-pi_ai_rnd.serial_reader — non-blocking Arduino serial line capture.
-
-Stage2 / Step 1: display *raw* Arduino serial output on the Pi GUI.
-
-Key behaviours:
-- Non-blocking poll() that can be called from the camera loop.
-- Automatic reconnect when the port disappears (Arduino reset / unplug).
-- Ring buffer for the last N lines.
-
-This module purposely does *not* parse or interpret the Arduino protocol.
-"""
-
 from __future__ import annotations
 
-import glob
+import threading
 import time
-from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, Tuple
+from typing import List, Optional
 
-
-def _auto_ports_linux() -> List[str]:
-    """
-    Prefer stable-by-id paths first, then fall back to common tty names.
-    """
-    ports: List[str] = []
-    ports.extend(sorted(glob.glob("/dev/serial/by-id/*")))
-    ports.extend([p for p in ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0", "/dev/ttyUSB1"] if p])
-    # Dedup, keep order
-    seen = set()
-    out = []
-    for p in ports:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
+try:
+    import serial  # pyserial
+except Exception:  # pragma: no cover
+    serial = None
 
 
 @dataclass
-class SerialState:
-    connected: bool = False
-    port: str = ""
-    baud: int = 115200
-    last_line_age_s: Optional[float] = None
-    last_error: Optional[str] = None
+class SerialStatus:
+    connected: bool
+    port: str
+    baud: int
+    last_line: str = ""
+    state: str = ""          # e.g. "PICTRL", "MANUAL"
+    state_ts: float = 0.0    # monotonic timestamp of last state update
 
 
-class SerialPoller:
+class SerialReader:
     """
-    Non-blocking serial line reader with reconnect.
-
-    Usage:
-        poller = SerialPoller(enabled=True, port="auto", baud=115200, max_lines=30)
-        status, lines = poller.poll()   # call every frame
-        poller.close()
+    Background serial reader.
+    - Keeps a rolling buffer of the last N lines for GUI
+    - Tracks Arduino state by parsing:
+        - Telemetry:  T,<STATE>,...
+        - State print: [STATE] -> <STATE>
+    - Provides write_line() for sending commands to Arduino
     """
 
-    def __init__(
-        self,
-        enabled: bool,
-        port: str,
-        baud: int = 115200,
-        max_lines: int = 30,
-        reconnect_s: float = 1.0,
-    ) -> None:
-        self.enabled = bool(enabled)
-        self.port = port or "auto"
+    def __init__(self, port: str, baud: int = 115200, keep_lines: int = 50, connect_timeout_s: float = 2.0):
+        self.port = port
         self.baud = int(baud)
-        self.max_lines = max(1, int(max_lines))
-        self.reconnect_s = max(0.2, float(reconnect_s))
+        self.keep_lines = int(max(5, keep_lines))
+        self.connect_timeout_s = float(connect_timeout_s)
 
-        self._buf: Deque[str] = deque(maxlen=self.max_lines)
-        self._ser = None  # pyserial Serial instance
-        self._last_attempt_t = 0.0
-        self._last_line_t: Optional[float] = None
-        self._state = SerialState(connected=False, port=self.port, baud=self.baud)
+        self._lock = threading.Lock()
+        self._lines: List[str] = []
+        self._status = SerialStatus(connected=False, port=self.port, baud=self.baud)
 
-        # Defer importing pyserial until actually needed
-        self._serial_mod = None
-        if self.enabled:
-            try:
-                import serial  # type: ignore
-                self._serial_mod = serial
-            except Exception as e:
-                self.enabled = False
-                self._state.last_error = f"pyserial not available ({type(e).__name__})"
+        self._ser = None
+        self._stop = False
+        self._thr: Optional[threading.Thread] = None
 
-    def _pick_port(self) -> Optional[str]:
-        if self.port and self.port.lower() != "auto":
-            return self.port
+    def start(self) -> None:
+        self._stop = False
+        self._thr = threading.Thread(target=self._run, name="SerialReader", daemon=True)
+        self._thr.start()
 
-        # Linux auto-scan (Pi)
-        for p in _auto_ports_linux():
-            return p
-        return None
+    def stop(self) -> None:
+        self._stop = True
+        if self._thr:
+            self._thr.join(timeout=1.0)
+        self._close()
 
-    def _try_open(self) -> None:
-        if not self.enabled or self._serial_mod is None:
+    # ---------- public API ----------
+    def get_last_lines(self, n: int = 3) -> List[str]:
+        n = int(max(1, n))
+        with self._lock:
+            return self._lines[-n:].copy()
+
+    def status(self) -> SerialStatus:
+        with self._lock:
+            return SerialStatus(**self._status.__dict__)
+
+    def is_pi_control(self) -> bool:
+        st = self.status().state.upper()
+        return st in ("PICTRL", "PI_CONTROL", "AUTO_PI")
+
+    def write_line(self, s: str) -> bool:
+        """
+        Send a single line (adds newline if missing).
+        Returns True if written, False if not connected.
+        """
+        if not s:
+            return False
+        if not s.endswith("\n"):
+            s = s + "\n"
+
+        with self._lock:
+            ser = self._ser
+        if ser is None:
+            return False
+
+        try:
+            ser.write(s.encode("utf-8"))
+            return True
+        except Exception:
+            self._close()
+            return False
+
+    # ---------- internals ----------
+    def _append_line(self, line: str) -> None:
+        line = line.strip()
+        if not line:
             return
 
         now_t = time.monotonic()
-        if (now_t - self._last_attempt_t) < self.reconnect_s:
-            return
-        self._last_attempt_t = now_t
+        new_state = self._parse_state(line)
 
-        port = self._pick_port()
-        self._state.port = port or "auto"
-        if not port:
-            self._state.connected = False
-            self._state.last_error = "no serial port found"
-            return
+        with self._lock:
+            self._lines.append(line)
+            if len(self._lines) > self.keep_lines:
+                self._lines = self._lines[-self.keep_lines :]
 
-        try:
-            # timeout=0 makes reads non-blocking
-            self._ser = self._serial_mod.Serial(port=port, baudrate=self.baud, timeout=0)
-            self._state.connected = True
-            self._state.last_error = None
-        except Exception as e:
-            self._ser = None
-            self._state.connected = False
-            self._state.last_error = f"open failed: {type(e).__name__}: {e}"
+            self._status.last_line = line
 
-    def close(self) -> None:
-        if self._ser is not None:
+            if new_state:
+                self._status.state = new_state
+                self._status.state_ts = now_t
+
+    @staticmethod
+    def _parse_state(line: str) -> str:
+        # Telemetry: "T,PICTRL,3,1,1,1234,12.3"
+        if line.startswith("T,"):
+            parts = line.split(",")
+            if len(parts) >= 2:
+                return parts[1].strip()
+
+        # State print: "[STATE] -> PICTRL"
+        if "[STATE]" in line and "->" in line:
+            # take the part after "->"
             try:
-                self._ser.close()
+                rhs = line.split("->", 1)[1].strip()
+                # first token only
+                return rhs.split()[0].strip()
             except Exception:
-                pass
-        self._ser = None
-        self._state.connected = False
+                return ""
 
-    def poll(self) -> Tuple[str, List[str]]:
-        """
-        Returns (status_string, lines_list).
-        - status_string includes connection + age of last line.
-        - lines_list is newest-last, capped to max_lines.
-        """
-        if not self.enabled:
-            return ("DISABLED", list(self._buf))
+        return ""
 
-        if self._ser is None or not getattr(self._ser, "is_open", False):
-            self._try_open()
-            if self._ser is None:
-                age = None
-                self._state.last_line_age_s = age
-                err = self._state.last_error or "disconnected"
-                return (f"DISCONNECTED ({err})", list(self._buf))
+    def _connect(self) -> None:
+        if serial is None:
+            with self._lock:
+                self._status.connected = False
+            return
 
-        # Read all available lines without blocking
         try:
-            while True:
-                raw = self._ser.readline()
+            ser = serial.Serial(self.port, self.baud, timeout=0.1, write_timeout=0.2)
+            # settle
+            time.sleep(0.15)
+            with self._lock:
+                self._ser = ser
+                self._status.connected = True
+        except Exception:
+            self._close()
+
+    def _close(self) -> None:
+        with self._lock:
+            ser = self._ser
+            self._ser = None
+            self._status.connected = False
+        try:
+            if ser is not None:
+                ser.close()
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        # (re)connect loop
+        last_try = 0.0
+
+        while not self._stop:
+            with self._lock:
+                ser = self._ser
+
+            if ser is None:
+                now = time.monotonic()
+                if (now - last_try) > self.connect_timeout_s:
+                    last_try = now
+                    self._connect()
+                time.sleep(0.05)
+                continue
+
+            try:
+                raw = ser.readline()
                 if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                if line:
-                    self._buf.append(line)
-                    self._last_line_t = time.monotonic()
-        except Exception as e:
-            # Port likely went away; close and report, will reconnect later
-            self._state.last_error = f"read failed: {type(e).__name__}: {e}"
-            self.close()
-            return (f"DISCONNECTED ({self._state.last_error})", list(self._buf))
-
-        # Build status text
-        age_s: Optional[float] = None
-        if self._last_line_t is not None:
-            age_s = max(0.0, time.monotonic() - self._last_line_t)
-        self._state.last_line_age_s = age_s
-
-        port_name = getattr(self._ser, "port", self.port)
-        if age_s is None:
-            return (f"CONNECTED {port_name} @ {self.baud} (no lines yet)", list(self._buf))
-        return (f"CONNECTED {port_name} @ {self.baud} (last {age_s:.1f}s)", list(self._buf))
+                    time.sleep(0.005)
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                self._append_line(line)
+            except Exception:
+                self._close()
+                time.sleep(0.1)

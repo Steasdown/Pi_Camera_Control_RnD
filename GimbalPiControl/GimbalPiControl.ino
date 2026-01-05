@@ -1,19 +1,7 @@
-#include <Arduino.h>
-#include <AccelStepper.h>
 #include <ezButton.h>
-
 #include "GimbalGlobal.h"
+#include "MotorControl.h"
 #include "PiCommunication.h"
-
-/*
-  GimbalPiControl.ino (Stage1 cleanup + compile fix)
-
-  Goals (NO functional change):
-  - Keep GimbalGlobal.h and PiCommunication.* as-is
-  - Inline motor control (remove dependency on MotorControl.*)
-  - Keep state machine behaviour/output the same as your current split version
-  - PI_CONTROL only consumes Pi commands while in PI_CONTROL
-*/
 
 // ----------------- INPUT BUTTON OBJECTS -----------------
 ezButton joySW(PIN_JOY_SW);
@@ -22,64 +10,33 @@ ezButton rockR(PIN_ROCK_R);
 ezButton btn1(PIN_BTN1);
 ezButton btn2(PIN_BTN2);
 
-// ----------------- STEPPER OBJECT -----------------
-// Uses pin/constants from GimbalGlobal.h
-AccelStepper motor(interfaceType, motor1StepPin, motor1DirPin);
-
 // ----------------- STATE MACHINE -----------------
-/*
-  ORIENTATION:
-    - Jog motor with joystick (no limits until homed)
-    - Press joystick switch to set HOME (pos=0), enter MANUAL
-
-  MANUAL:
-    - Joystick controls motor with soft limits +/- LIMIT_STEPS
-    - Joystick switch toggles holdEnable (keeps driver enabled even when joystick released)
-
-  RETURN_HOME:
-    - Drive back to pos=0 at HOME_SPEED (scaled by sens)
-    - When at home, go back to MANUAL
-
-  PI_CONTROL:
-    - Pi owns motion via serial commands (PANSPD)
-    - Driver stays enabled (holds position even at 0 speed)
-    - Limits still enforced
-*/
 enum State { ORIENTATION, MANUAL, RETURN_HOME, PI_CONTROL };
 static State state = ORIENTATION;
 
-static bool  homed = false;
-static int   sensLevel = 3;        // 1..5
-static bool  holdEnable = false;   // MANUAL only
+static bool homed = false;
+static int  sensLevel = 3;     // 1..5
 
-// ----------------- PI CONTROL -----------------
-/*
-  PI_CONTROL expects commands parsed by PiCommunication:
-    PANSPD <float>  -> sets piTargetSpeed (steps/s, signed)
-    STOP            -> sets piTargetSpeed = 0
-    HOME            -> set pos=0, leave PI_CONTROL, go MANUAL (same as joystick-home)
-    MODE <...>      -> allow MANUAL or PI_CONTROL (AUTO_PI synonyms supported)
-*/
-PiCommunication piComm;
+// Hold enable (keeps driver enabled in MANUAL even when joystick released)
+static bool holdEnable = false;
+
+// PI_CONTROL: speed command from Pi (steps/sec, signed)
 static float piTargetSpeed = 0.0f;
 
-// ----------------- JOYSTICK CENTER + FILTER -----------------
-static int   xCenter = 512;
-static int   yCenter = 512;
+// Joystick center calibration
+static int xCenter = 512;
+static int yCenter = 512;
+
+// IIR filter
 static float xFilt = 512.0f;
 static float yFilt = 512.0f;
 
-// ----------------- SPEED RAMP (runSpeed mode) -----------------
-/*
-  We generate steps using motor.runSpeed() and implement our own accel ramp so
-  behaviour matches your earlier implementation / MotorControl.apply().
-*/
-static float targetSpeed  = 0.0f;    // steps/sec
-static float currentSpeed = 0.0f;    // steps/sec
-static unsigned long lastSpeedUs = 0;
-
-// ----------------- TELEMETRY TIMING -----------------
+// Periodic print timing
 static unsigned long lastPrintMs = 0;
+
+// ----------------- MODULES -----------------
+MotorControl motor;
+PiCommunication piComm;
 
 // ----------------- HELPERS -----------------
 static const char* stateName(State s) {
@@ -92,62 +49,14 @@ static const char* stateName(State s) {
   }
 }
 
-static void setDriverEnable(bool enabled) {
-  // A4988/DRV8825 typical: EN is ACTIVE LOW (ENABLE_ACTIVE_LOW=true in GimbalGlobal.h)
-  if (ENABLE_ACTIVE_LOW) digitalWrite(motor1EnablePin, enabled ? LOW : HIGH);
-  else                   digitalWrite(motor1EnablePin, enabled ? HIGH : LOW);
-}
-
-static void resetRamp() {
-  targetSpeed = 0.0f;
-  currentSpeed = 0.0f;
-  lastSpeedUs = micros();
-}
-
-static float degFromSteps(long steps) {
-  return ((float)steps / (float)STEPS_PER_REV) * 360.0f;
-}
-
-static void updateSpeedRamp(float accel_s2) {
-  unsigned long nowUs = micros();
-  if (lastSpeedUs == 0) lastSpeedUs = nowUs;
-
-  float dt = (float)(nowUs - lastSpeedUs) / 1000000.0f;
-  lastSpeedUs = nowUs;
-  if (dt <= 0.0f) return;
-
-  float maxDelta = accel_s2 * dt;
-  float diff = targetSpeed - currentSpeed;
-
-  if (diff > maxDelta)       currentSpeed += maxDelta;
-  else if (diff < -maxDelta) currentSpeed -= maxDelta;
-  else                       currentSpeed = targetSpeed;
-}
-
-static void applyMotor(bool enabled, float newTargetSpeed, float accel_s2) {
-  setDriverEnable(enabled);
-
-  if (!enabled) {
-    // Hard stop + reset ramp (matches original / MotorControl.apply() behaviour)
-    targetSpeed = 0.0f;
-    currentSpeed = 0.0f;
-    motor.setSpeed(0.0f);
-    return;
-  }
-
-  targetSpeed = newTargetSpeed;
-  updateSpeedRamp(accel_s2);
-  motor.setSpeed(currentSpeed);
-  motor.runSpeed();
-}
-
 static void transitionTo(State next) {
   if (state != next) {
-    // On leaving PI_CONTROL, stop motion + clear pending command
+    // On leaving PI_CONTROL, stop motion for safety
     if (state == PI_CONTROL) {
       piTargetSpeed = 0.0f;
       piComm.clear();
     }
+
     state = next;
     Serial.print(F("[STATE] -> "));
     Serial.println(stateName(state));
@@ -208,7 +117,7 @@ static void handlePiCommandsOnlyInPiControl() {
 
   switch (c.type) {
     case PiCommandType::PANSPD:
-      // Store speed; applied in PI_CONTROL state below
+      // Store speed; applied by PI_CONTROL state below
       piTargetSpeed = c.value;
       break;
 
@@ -217,13 +126,12 @@ static void handlePiCommandsOnlyInPiControl() {
       break;
 
     case PiCommandType::HOME:
-      // Same behaviour as setting home via joystick press
       motor.setCurrentPosition(0);
       homed = true;
-      holdEnable = true;
+      holdEnable = false;
       piTargetSpeed = 0.0f;
-      resetRamp();
-      setDriverEnable(true);
+      motor.resetRamp();
+      motor.setDriverEnable(false);
       Serial.println(F("[EVENT] HOME set (pos=0) [PI]."));
       transitionTo(MANUAL);
       break;
@@ -250,7 +158,6 @@ static void handlePiCommandsOnlyInPiControl() {
 void setup() {
   Serial.begin(115200);
 
-  // Inputs
   pinMode(PIN_JOY_SW, INPUT_PULLUP);
   pinMode(PIN_ROCK_L, INPUT_PULLUP);
   pinMode(PIN_ROCK_R, INPUT_PULLUP);
@@ -263,15 +170,10 @@ void setup() {
   btn1.setDebounceTime(BTN_DEBOUNCE_MS);
   btn2.setDebounceTime(BTN_DEBOUNCE_MS);
 
-  // Motor driver
-  pinMode(motor1EnablePin, OUTPUT);
-  setDriverEnable(false);
-
+  motor.begin();
   motor.setMaxSpeed(BASE_MAX_SPEED);
   motor.setCurrentPosition(0);
-  resetRamp();
 
-  // Boot info
   Serial.println(F("Stepper+Joystick (state machine)"));
   Serial.println(F("Boot state: ORIENT. Press joystick button to set HOME and enter MANUAL."));
   Serial.print(F("Limit: +/-")); Serial.print(LIMIT_DEG); Serial.println(F(" deg from HOME."));
@@ -282,14 +184,14 @@ void setup() {
 
 // ----------------- LOOP -----------------
 void loop() {
-  // ---- 1) Update buttons ----
+  // Update buttons
   joySW.loop();
   rockL.loop();
   rockR.loop();
   btn1.loop();
   btn2.loop();
 
-  // ---- 2) Read + filter joystick ----
+  // Read + filter joystick raw values
   int xRaw = analogRead(PIN_JOY_X);
   int yRaw = analogRead(PIN_JOY_Y);
 
@@ -298,9 +200,9 @@ void loop() {
 
   int xUse = (int)(xFilt + 0.5f);
   int yUse = (int)(yFilt + 0.5f);
-  (void)yUse; // reserved
+  (void)yUse; // reserved for later
 
-  // ---- 3) Sensitivity rocker (1..5) ----
+  // Sensitivity rocker
   if (rockL.isPressed()) {
     sensLevel = clampi(sensLevel - 1, 1, 5);
     Serial.print(F("[EVENT] Sens- level=")); Serial.println(sensLevel);
@@ -310,17 +212,17 @@ void loop() {
     Serial.print(F("[EVENT] Sens+ level=")); Serial.println(sensLevel);
   }
 
-  // ---- 4) Joystick button behaviour ----
-  // ORIENT: set home -> MANUAL
-  // MANUAL: toggle holdEnable
+  // Joystick button behaviour:
+  // - In ORIENT: set HOME and go MANUAL
+  // - In MANUAL: toggle HOLD enable
   if (joySW.isPressed()) {
     if (state == ORIENTATION) {
       motor.setCurrentPosition(0);
       homed = true;
-      holdEnable = true;
+      holdEnable = false;
       piTargetSpeed = 0.0f;
-      resetRamp();
-      setDriverEnable(true);
+      motor.resetRamp();
+      motor.setDriverEnable(false);
       Serial.println(F("[EVENT] HOME set (pos=0)."));
       transitionTo(MANUAL);
     } else if (state == MANUAL) {
@@ -330,7 +232,7 @@ void loop() {
     }
   }
 
-  // ---- 5) Return-home ----
+  // Return-home
   if (btn1.isPressed()) {
     if (homed) {
       Serial.println(F("[EVENT] Return-to-home requested."));
@@ -340,7 +242,7 @@ void loop() {
     }
   }
 
-  // ---- 6) Button 2 toggles PI_CONTROL ----
+  // Button 2 now toggles PI_CONTROL (replaces AUTO)
   if (btn2.isPressed()) {
     if (!homed) {
       Serial.println(F("[EVENT] PiControl ignored (not homed)."));
@@ -357,38 +259,36 @@ void loop() {
     }
   }
 
-  // ---- 7) Pi commands (PI_CONTROL only) ----
+  // Enable pi comm only in PI_CONTROL mode
   handlePiCommandsOnlyInPiControl();
 
-  // ---- 8) Compute target speed + enable by state ----
+  // Compute command by state
   long pos = motor.currentPosition();
   float sensMul = (float)sensLevel / 5.0f;
-  float accel_s2 = accelForSens(sensLevel); // from GimbalGlobal.h
 
   bool  driverEnable = false;
   float newTarget = 0.0f;
 
+  float accel_s2 = accelForSens(sensLevel);
+
   switch (state) {
     case ORIENTATION: {
-      // Joystick jog; no limits until homed
       int dx = xUse - xCenter;
       bool joyActive = (abs(dx) >= ENABLE_THRESH_ADC);
 
-      driverEnable = true;
+      driverEnable = joyActive;
       newTarget = joyActive ? joystickToSpeed(xUse, xCenter, BASE_MAX_SPEED * sensMul) : 0.0f;
     } break;
 
     case MANUAL: {
-      // Manual joystick with soft limits, enable if active or holdEnable
       int dx = xUse - xCenter;
       bool joyActive = (abs(dx) >= ENABLE_THRESH_ADC);
 
       driverEnable = joyActive || holdEnable;
       newTarget = joyActive ? joystickToSpeed(xUse, xCenter, BASE_MAX_SPEED * sensMul) : 0.0f;
 
-      // Enforce +/- LIMIT
-      if (pos >= LIMIT_STEPS && newTarget > 0) newTarget = 0.0f;
-      if (pos <= -LIMIT_STEPS && newTarget < 0) newTarget = 0.0f;
+      if (pos >= LIMIT_STEPS && newTarget > 0) newTarget = 0;
+      if (pos <= -LIMIT_STEPS && newTarget < 0) newTarget = 0;
     } break;
 
     case RETURN_HOME: {
@@ -405,31 +305,28 @@ void loop() {
     } break;
 
     case PI_CONTROL: {
-      // Pi owns movement; always enabled to "hold"
+      // Pi owns movement. No auto sweep.
       driverEnable = true;
 
+      // Optional: let sensitivity cap max speed
       float maxPi = BASE_MAX_SPEED * sensMul;
       newTarget = piTargetSpeed;
-
-      // Cap by sens
       if (newTarget >  maxPi) newTarget =  maxPi;
       if (newTarget < -maxPi) newTarget = -maxPi;
 
-      // Enforce limits
-      if (pos >= LIMIT_STEPS && newTarget > 0) newTarget = 0.0f;
-      if (pos <= -LIMIT_STEPS && newTarget < 0) newTarget = 0.0f;
+      if (pos >= LIMIT_STEPS && newTarget > 0) newTarget = 0;
+      if (pos <= -LIMIT_STEPS && newTarget < 0) newTarget = 0;
     } break;
   }
 
-  // ---- 9) Apply motor enable + ramp + stepping ----
-  applyMotor(driverEnable, newTarget, accel_s2);
+  motor.apply(driverEnable, newTarget, accel_s2);
 
-  // ---- 10) Telemetry (condensed) ----
+  // Serial status (condensed)
   unsigned long now = millis();
   if (now - lastPrintMs >= PRINT_PERIOD_MS) {
     lastPrintMs = now;
 
-    float deg = degFromSteps(pos);
+    float deg = motor.degFromSteps(pos);
 
     Serial.print(F("T,"));
     Serial.print(stateName(state));

@@ -1,3 +1,12 @@
+"""
+pi_ai_rnd.config — load runtime configuration.
+
+Stage2 additions (Arduino integration Step 1):
+- serial_enabled / serial_port / serial_baud
+- serial_lines (ring buffer size)
+- serial_reconnect_s (retry period)
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,50 +17,58 @@ from typing import Any, Dict
 
 @dataclass
 class AppConfig:
-    # IMX500 / detection
+    # Model / inference
     model_path: str = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
     score_threshold: float = 0.55
+    print_hz: float = 5.0
     target_class_id: int = 0
     target_class_name: str = "person"
-    print_hz: float = 5.0
 
-    # Serial / Arduino
-    serial_port: str = "/dev/ttyACM0"
+    # Camera / preview
+    camera_num: int = 0
+    view_w: int = 1280
+    view_h: int = 720
+    camera_format: str = "RGB888"
+    buffer_count: int = 6
+
+    # Stage2 Step1: Serial monitor (raw)
+    serial_enabled: bool = False
+    serial_port: str = "auto"       # "auto" or "/dev/ttyACM0" or "/dev/serial/by-id/..."
     serial_baud: int = 115200
-
-    # Tracking -> PANSPD
-    pan_deadband_px: int = 50
-    pan_kp: float = 4.0            # steps/s per pixel of dx
-    pan_max_speed: float = 900.0   # cap steps/s
-    pan_min_speed: float = 120.0   # minimum magnitude when outside deadband (overcome stiction)
-    pan_send_hz: float = 10.0      # command update rate
-    pan_invert: bool = False       # invert sign if motor direction is reversed
+    serial_lines: int = 30          # 20–50 recommended
+    serial_reconnect_s: float = 1.0
 
 
-def _get(d: Dict[str, Any], k: str, default: Any) -> Any:
-    return d[k] if k in d else default
+def _as_dict(x: Any) -> Dict[str, Any]:
+    if isinstance(x, dict):
+        return x
+    raise TypeError("config JSON must be an object")
 
 
 def load_config(path: Path) -> AppConfig:
+    cfg = AppConfig()
     if not path.exists():
-        return AppConfig()
+        return cfg
 
-    data = json.loads(path.read_text(encoding="utf-8"))
-    cfg = AppConfig(
-        model_path=str(_get(data, "model_path", AppConfig.model_path)),
-        score_threshold=float(_get(data, "score_threshold", AppConfig.score_threshold)),
-        target_class_id=int(_get(data, "target_class_id", AppConfig.target_class_id)),
-        target_class_name=str(_get(data, "target_class_name", AppConfig.target_class_name)),
-        print_hz=float(_get(data, "print_hz", AppConfig.print_hz)),
+    data = _as_dict(json.loads(path.read_text(encoding="utf-8")))
+    for k, v in data.items():
+        if not hasattr(cfg, k):
+            continue
+        setattr(cfg, k, v)
 
-        serial_port=str(_get(data, "serial_port", AppConfig.serial_port)),
-        serial_baud=int(_get(data, "serial_baud", AppConfig.serial_baud)),
+    # basic sanitation
+    cfg.score_threshold = float(cfg.score_threshold)
+    cfg.print_hz = float(cfg.print_hz)
+    cfg.target_class_id = int(cfg.target_class_id)
+    cfg.camera_num = int(cfg.camera_num)
+    cfg.view_w = int(cfg.view_w)
+    cfg.view_h = int(cfg.view_h)
+    cfg.buffer_count = int(cfg.buffer_count)
 
-        pan_deadband_px=int(_get(data, "pan_deadband_px", AppConfig.pan_deadband_px)),
-        pan_kp=float(_get(data, "pan_kp", AppConfig.pan_kp)),
-        pan_max_speed=float(_get(data, "pan_max_speed", AppConfig.pan_max_speed)),
-        pan_min_speed=float(_get(data, "pan_min_speed", AppConfig.pan_min_speed)),
-        pan_send_hz=float(_get(data, "pan_send_hz", AppConfig.pan_send_hz)),
-        pan_invert=bool(_get(data, "pan_invert", AppConfig.pan_invert)),
-    )
+    cfg.serial_enabled = bool(cfg.serial_enabled)
+    cfg.serial_port = str(cfg.serial_port)
+    cfg.serial_baud = int(cfg.serial_baud)
+    cfg.serial_lines = int(cfg.serial_lines)
+    cfg.serial_reconnect_s = float(cfg.serial_reconnect_s)
+
     return cfg

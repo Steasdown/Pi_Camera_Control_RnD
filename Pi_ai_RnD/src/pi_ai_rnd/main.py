@@ -1,26 +1,58 @@
+#!/usr/bin/env python3
+"""pi_ai_rnd.main
+
+Stage1:
+- Prototype B: IMX500 detections printed over SSH
+- Prototype C2: OpenCV preview + bbox overlay
+
+Stage2 / Step 1 (Arduino integration):
+- Display raw Arduino serial output as an on-screen panel.
+"""
+
 from __future__ import annotations
 
 import argparse
 import time
 from pathlib import Path
-from typing import Optional, Tuple
-
-import cv2
+from typing import Any, Optional
 
 from .config import AppConfig, load_config
 from .imx500_adapter import build_detections, filter_by_class, normalize_ssd_outputs
-from .overlay import draw_overlay
-from .serial_reader import SerialReader
+from .logging_utils import hz_to_dt
+from .overlay import clamp_xywh, draw_text_panel
+from .serial_reader import SerialPoller
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/runtime.json")
-    p.add_argument("--debug", action="store_true")
-    p.add_argument("--run-c2", action="store_true")
-    p.add_argument("--run-seconds", type=float, default=0.0)
-    p.add_argument("--view-size", default="1270x720")
+    p = argparse.ArgumentParser(description="Pi AI Camera RnD")
+    p.add_argument("--config", default="configs/runtime.json", help="Runtime config JSON")
+    p.add_argument("--debug", action="store_true", help="Verbose debug output")
+
+    # Prototype B (SSH prints)
+    p.add_argument("--run-b", action="store_true", help="Prototype B: print detections")
+    p.add_argument("--run-seconds", type=float, default=10.0, help="How long to run")
+
+    # Prototype C2 (OpenCV window)
+    p.add_argument("--run-c2", action="store_true", help="Prototype C2: OpenCV preview")
+    p.add_argument("--view-size", default=None, help="Override preview size WxH (e.g. 1280x720)")
+
+    # Stage2/Step1: Serial overrides (optional)
+    p.add_argument("--serial", action="store_true", help="Enable serial monitor")
+    p.add_argument("--no-serial", action="store_true", help="Disable serial monitor")
+    p.add_argument("--serial-port", default=None, help="Serial port or 'auto'")
+    p.add_argument("--serial-baud", type=int, default=None, help="Serial baud")
+    p.add_argument("--serial-lines", type=int, default=None, help="Ring buffer size")
+
     return p.parse_args()
+
+
+def _shape(x: Any) -> str:
+    s = getattr(x, "shape", None)
+    if s is not None:
+        return str(s)
+    if isinstance(x, (list, tuple)):
+        return f"list(len={len(x)})"
+    return f"{type(x).__name__}"
 
 
 def _get_outputs(imx500, metadata):
@@ -30,106 +62,54 @@ def _get_outputs(imx500, metadata):
         return imx500.get_outputs(metadata)
 
 
-def _rect_to_xywh(obj, frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
-    # picamera2 versions return different rect types
+def _rect_to_xywh(obj, frame_w: int, frame_h: int):
     if hasattr(obj, "x") and hasattr(obj, "y") and hasattr(obj, "width") and hasattr(obj, "height"):
-        x, y, w, h = int(obj.x), int(obj.y), int(obj.width), int(obj.height)
-    elif isinstance(obj, (tuple, list)) and len(obj) == 4:
+        return int(obj.x), int(obj.y), int(obj.width), int(obj.height)
+
+    if isinstance(obj, (tuple, list)) and len(obj) == 4:
         a, b, c, d = (float(obj[0]), float(obj[1]), float(obj[2]), float(obj[3]))
-        # heuristic: treat as (x,y,w,h) if sums are plausible
         if (a + c) <= (frame_w * 1.2) and (b + d) <= (frame_h * 1.2):
-            x, y, w, h = int(a), int(b), int(c), int(d)
+            x, y, w, h = a, b, c, d
         else:
             x1, y1, x2, y2 = a, b, c, d
-            x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-    else:
-        raise TypeError(f"Unsupported rect type: {type(obj).__name__} {obj!r}")
+            x, y, w, h = x1, y1, (x2 - x1), (y2 - y1)
+        return int(x), int(y), int(w), int(h)
 
-    # clamp
-    x = max(0, min(x, frame_w - 1))
-    y = max(0, min(y, frame_h - 1))
-    w = max(1, min(w, frame_w - x))
-    h = max(1, min(h, frame_h - y))
-    return x, y, w, h
+    raise TypeError(f"Unsupported rect type: {type(obj).__name__} {obj!r}")
 
 
-def _pan_command_from_dx(cfg: AppConfig, dx_px: float) -> float:
-    # deadband
-    if abs(dx_px) <= float(cfg.pan_deadband_px):
-        return 0.0
-
-    spd = float(cfg.pan_kp) * float(dx_px)
-    if cfg.pan_invert:
-        spd = -spd
-
-    # enforce min magnitude outside deadband
-    if spd > 0:
-        spd = max(spd, float(cfg.pan_min_speed))
-    else:
-        spd = min(spd, -float(cfg.pan_min_speed))
-
-    # cap
-    spd = max(-float(cfg.pan_max_speed), min(float(cfg.pan_max_speed), spd))
-    return spd
-
-
-def _run_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size: str) -> int:
+def _run_prototype_b(cfg: AppConfig, debug: bool, run_seconds: float) -> int:
     try:
         from picamera2 import Picamera2
         from picamera2.devices.imx500 import IMX500
     except Exception as e:
-        print("[C2] Picamera2/IMX500 not available.")
-        print(f"[C2] {type(e).__name__}: {e}")
+        print("[B] Picamera2/IMX500 not available.")
+        print(f"[B] {type(e).__name__}: {e}")
         return 2
 
-    # view size
-    try:
-        w_str, h_str = view_size.lower().split("x")
-        frame_w, frame_h = int(w_str), int(h_str)
-        if frame_w <= 0 or frame_h <= 0:
-            raise ValueError
-    except Exception:
-        print(f"[C2] Bad --view-size '{view_size}' (use WxH).")
-        return 2
+    frame_w, frame_h = cfg.view_w, cfg.view_h
 
-    print("[C2] starting")
-    print(f"[C2] model_path: {cfg.model_path}")
-    print(f"[C2] threshold: {cfg.score_threshold}")
-    print(f"[C2] serial: {cfg.serial_port}@{cfg.serial_baud}")
-    print(f"[C2] view: {frame_w}x{frame_h}")
+    print("[B] starting")
+    print(f"[B] model_path: {cfg.model_path}")
+    print(f"[B] threshold: {cfg.score_threshold}")
+    print(f"[B] target_class_id: {cfg.target_class_id} ({cfg.target_class_name})")
+    print(f"[B] run_seconds: {run_seconds}")
 
-    # Serial
-    ser = SerialReader(cfg.serial_port, cfg.serial_baud, keep_lines=50)
-    ser.start()
-
-    # Camera
     imx500 = IMX500(cfg.model_path)
     picam2 = Picamera2(imx500.camera_num)
 
-    # Use RGB888 from camera, convert to BGR once for OpenCV
-    cam_cfg = picam2.create_preview_configuration(
-        main={"size": (frame_w, frame_h), "format": "RGB888"},
-        buffer_count=6,
+    config = picam2.create_preview_configuration(
+        main={"size": (frame_w, frame_h), "format": cfg.camera_format},
+        buffer_count=cfg.buffer_count,
     )
-    picam2.configure(cam_cfg)
+    picam2.configure(config)
 
-    window_name = "Pi AI RnD (C2)"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    last_print = 0.0
+    min_dt = hz_to_dt(cfg.print_hz)
 
-    # latch last detection briefly to avoid “blink”
-    hold_s = 0.25
-    last_det_t = -1e9
-    last_bbox: Optional[Tuple[int, int, int, int]] = None
-    last_score = 0.0
-    last_dx = 0.0
-
-    # PANSPD send rate limit
-    send_min_dt = 1.0 / max(1.0, float(cfg.pan_send_hz))
-    last_send_t = 0.0
-    last_sent_speed: Optional[float] = None
-
-    deadline = time.monotonic() + float(run_seconds) if run_seconds > 0 else float("inf")
+    deadline = time.monotonic() + float(run_seconds)
     frames = 0
+    printed = 0
 
     try:
         picam2.start()
@@ -139,19 +119,11 @@ def _run_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size: str) -> 
             try:
                 frames += 1
                 metadata = req.get_metadata()
-                frame_rgb = req.make_array("main")
                 outputs = _get_outputs(imx500, metadata)
                 norm = normalize_ssd_outputs(outputs)
-            finally:
-                req.release()
+                if norm is None:
+                    continue
 
-            # OpenCV expects BGR
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            now_t = time.monotonic()
-
-            # update detection
-            if norm is not None:
                 boxes, scores, classes, count = norm
                 dets = build_detections(
                     boxes=boxes,
@@ -162,114 +134,235 @@ def _run_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size: str) -> 
                 )
                 persons = filter_by_class(dets, cfg.target_class_id)
 
-                if persons:
-                    # largest bbox by area in pixel space (after conversion)
-                    best_bbox = None
-                    best_score = 0.0
-                    best_area = -1
+                now_t = time.monotonic()
+                if persons and (now_t - last_print) >= min_dt:
+                    d0 = max(persons, key=lambda d: d.score)
+                    rect = imx500.convert_inference_coords(d0.box, metadata, picam2)
+                    x, y, w, h = _rect_to_xywh(rect, frame_w, frame_h)
+                    x, y, w, h = clamp_xywh(x, y, w, h, frame_w, frame_h)
+                    cx, cy = x + w / 2.0, y + h / 2.0
 
-                    for d in persons:
-                        rect = imx500.convert_inference_coords(d.box, metadata, picam2)
-                        x, y, w, h = _rect_to_xywh(rect, frame_w, frame_h)
-                        area = w * h
-                        if area > best_area:
-                            best_area = area
-                            best_bbox = (x, y, w, h)
-                            best_score = float(d.score)
+                    print(
+                        f"[B][person] score={d0.score:.2f} "
+                        f"px=(x={x},y={y},w={w},h={h}) center=({cx:.1f},{cy:.1f}) raw={d0.box}"
+                    )
+                    printed += 1
+                    last_print = now_t
 
-                    if best_bbox is not None:
-                        x, y, w, h = best_bbox
-                        bbox_cx = x + w / 2.0
-                        frame_cx = frame_w / 2.0
-                        last_dx = bbox_cx - frame_cx
+                if debug and (frames % 60 == 0):
+                    print(f"[B][debug] frames={frames} persons={len(persons)} count={count}")
 
-                        last_bbox = best_bbox
-                        last_score = best_score
-                        last_det_t = now_t
+            finally:
+                req.release()
 
-            # detection latch expiry
-            bbox_for_draw = last_bbox if (last_bbox is not None and (now_t - last_det_t) <= hold_s) else None
-            dx_for_draw = last_dx if bbox_for_draw is not None else 0.0
-            score_for_draw = last_score if bbox_for_draw is not None else 0.0
+        print(f"[B] done: frames={frames} printed={printed}")
+        return 0
 
-            # PI_CONTROL detect + indicator
-            pi_control = ser.is_pi_control()
-            serial_lines = ser.get_last_lines(3)
+    finally:
+        picam2.stop()
+        picam2.close()
+        if debug:
+            print("[B] camera stopped/closed")
 
-            # Tracking -> PANSPD (ONLY when Arduino is in PI_CONTROL)
-            cmd_speed = 0.0
-            if pi_control and bbox_for_draw is not None:
-                cmd_speed = _pan_command_from_dx(cfg, dx_for_draw)
 
-            # send command (rate-limited + avoid duplicates)
-            if pi_control:
-                if (now_t - last_send_t) >= send_min_dt:
-                    to_send: Optional[str] = None
+def _run_prototype_c2(cfg: AppConfig, debug: bool, run_seconds: float, view_size: Optional[str]) -> int:
+    try:
+        import cv2
+        import numpy as np
+        from picamera2 import Picamera2
+        from picamera2.devices.imx500 import IMX500
+    except Exception as e:
+        print("[C2] Required modules not available.")
+        print(f"[C2] {type(e).__name__}: {e}")
+        return 2
 
-                    # STOP in deadband
-                    if cmd_speed == 0.0:
-                        # only send STOP once if previously moving
-                        if last_sent_speed is None or abs(last_sent_speed) > 1e-3:
-                            to_send = "STOP"
-                            last_sent_speed = 0.0
-                    else:
-                        # PANSPD value
-                        # only send if materially changed
-                        if last_sent_speed is None or abs(cmd_speed - last_sent_speed) >= 10.0:
-                            to_send = f"PANSPD {cmd_speed:.1f}"
-                            last_sent_speed = cmd_speed
+    frame_w, frame_h = cfg.view_w, cfg.view_h
+    if view_size:
+        try:
+            w_str, h_str = view_size.lower().split("x")
+            frame_w, frame_h = int(w_str), int(h_str)
+            if frame_w <= 0 or frame_h <= 0:
+                raise ValueError
+        except Exception:
+            print(f"[C2] Bad --view-size '{view_size}'. Use e.g. 1280x720")
+            return 2
 
-                    if to_send:
-                        ser.write_line(to_send)
-                        if debug:
-                            print(f"[TRACK] dx={dx_for_draw:+.1f}px -> {to_send}")
+    print("[C2] starting")
+    print(f"[C2] model_path: {cfg.model_path}")
+    print(f"[C2] threshold: {cfg.score_threshold}")
+    print(f"[C2] target_class_id: {cfg.target_class_id} ({cfg.target_class_name})")
+    print(f"[C2] view: {frame_w}x{frame_h}")
+    print("[C2] press 'q' in the window to quit")
 
-                    last_send_t = now_t
-            else:
-                # if not in PI_CONTROL, don’t push commands
-                last_sent_speed = None
+    imx500 = IMX500(cfg.model_path)
+    picam2 = Picamera2(imx500.camera_num)
 
-            # draw GUI
-            draw_overlay(
-                frame_bgr,
-                pi_control=pi_control,
-                bbox_xywh=bbox_for_draw,
-                score=score_for_draw,
-                dx_px=dx_for_draw,
-                serial_lines=serial_lines,
+    config = picam2.create_preview_configuration(
+        main={"size": (frame_w, frame_h), "format": "RGB888"},
+        buffer_count=max(4, int(cfg.buffer_count)),
+    )
+    picam2.configure(config)
+
+    window_name = "Pi AI RnD (C2)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    poller = SerialPoller(
+        enabled=cfg.serial_enabled,
+        port=cfg.serial_port,
+        baud=cfg.serial_baud,
+        max_lines=cfg.serial_lines,
+        reconnect_s=cfg.serial_reconnect_s,
+    )
+
+    last_print = 0.0
+    min_dt = hz_to_dt(cfg.print_hz)
+
+    deadline = time.monotonic() + float(run_seconds) if run_seconds > 0 else float("inf")
+    frames = 0
+    printed = 0
+
+    hold_s = 0.25
+    last_seen_t = -1e9
+    last_score = 0.0
+    last_xywh = None
+
+    try:
+        picam2.start()
+
+        while time.monotonic() < deadline:
+            req = picam2.capture_request()
+            try:
+                frames += 1
+                metadata = req.get_metadata()
+
+                # Frame must be taken before release
+                frame = req.make_array("main")
+
+                outputs = _get_outputs(imx500, metadata)
+                norm = normalize_ssd_outputs(outputs)
+            finally:
+                req.release()
+
+            serial_status, serial_lines = poller.poll()
+
+            # --- Serial display rules (Stage2 Step1 GUI) ---
+            # 1) bottom of screen
+            # 2) show ONLY last 3 lines
+            # 3) hide any lines containing RGB/BGR tokens
+            serial_lines_disp = [
+                l for l in serial_lines
+                if ("RGB" not in l) and ("BGR" not in l) and ("rgb" not in l) and ("bgr" not in l)
+            ][-3:]
+
+            draw_text_panel(
+                frame,
+                title="Arduino serial (raw)",
+                status=serial_status,
+                lines=serial_lines_disp,
+                max_lines=3,
+                anchor="bottom_left",
             )
 
-            cv2.imshow(window_name, frame_bgr)
+
+            now_t = time.monotonic()
+
+            if norm is not None:
+                boxes, scores, classes, count = norm
+                dets = build_detections(
+                    boxes=boxes,
+                    scores=scores,
+                    classes=classes,
+                    count=count,
+                    threshold=cfg.score_threshold,
+                )
+                persons = filter_by_class(dets, cfg.target_class_id)
+                if persons:
+                    d0 = max(persons, key=lambda d: d.score)
+                    rect = imx500.convert_inference_coords(d0.box, metadata, picam2)
+                    x, y, w, h = _rect_to_xywh(rect, frame_w, frame_h)
+                    x, y, w, h = clamp_xywh(x, y, w, h, frame_w, frame_h)
+
+                    last_xywh = (x, y, w, h)
+                    last_score = float(d0.score)
+                    last_seen_t = now_t
+
+                    if (now_t - last_print) >= min_dt:
+                        cx, cy = x + w / 2.0, y + h / 2.0
+                        print(
+                            f"[C2][person] score={last_score:.2f} "
+                            f"px=(x={x},y={y},w={w},h={h}) center=({cx:.1f},{cy:.1f})"
+                        )
+                        printed += 1
+                        last_print = now_t
+
+            if last_xywh is not None and (now_t - last_seen_t) <= hold_s:
+                x, y, w, h = last_xywh
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                cv2.putText(
+                    frame,
+                    f"person {last_score:.2f}",
+                    (x + 5, max(20, y - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                )
+                # --- GUI coords HUD (updates every frame while bbox is held) ---
+                cx, cy = x + w / 2.0, y + h / 2.0
+                hud = f"x={x} y={y}  cx={cx:.0f} cy={cy:.0f}  w={w} h={h}  s={last_score:.2f}"
+                cv2.putText(
+                    frame,
+                    hud,
+                    (10, 25),  # top-left, away from bottom serial panel
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+
+            cv2.imshow(window_name, frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
 
+        print(f"[C2] done: frames={frames} printed={printed}")
         return 0
 
     finally:
-        try:
-            picam2.stop()
-            picam2.close()
-        except Exception:
-            pass
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
-        try:
-            ser.stop()
-        except Exception:
-            pass
+        poller.close()
+        picam2.stop()
+        picam2.close()
+        cv2.destroyAllWindows()
+        if debug:
+            print("[C2] camera stopped/closed")
 
 
 def main() -> int:
     args = parse_args()
     cfg: AppConfig = load_config(Path(args.config))
 
-    if args.run_c2:
-        return _run_c2(cfg, args.debug, args.run_seconds, args.view_size)
+    # CLI overrides for serial settings
+    if args.serial:
+        cfg.serial_enabled = True
+    if args.no_serial:
+        cfg.serial_enabled = False
+    if args.serial_port is not None:
+        cfg.serial_port = args.serial_port
+    if args.serial_baud is not None:
+        cfg.serial_baud = int(args.serial_baud)
+    if args.serial_lines is not None:
+        cfg.serial_lines = int(args.serial_lines)
 
-    print("Use --run-c2")
+    if args.run_b:
+        return _run_prototype_b(cfg, args.debug, args.run_seconds)
+
+    if args.run_c2:
+        return _run_prototype_c2(cfg, args.debug, args.run_seconds, args.view_size)
+
+    print("Pi AI Camera RnD")
+    print("Use --run-b for Prototype B, or --run-c2 for Prototype C2")
     return 0
 
 
